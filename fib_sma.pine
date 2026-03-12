@@ -1,0 +1,171 @@
+//@version=6
+indicator("MTF Fibonacci + SMA Trend Direction Strategy", shorttitle="Fib SMA", overlay=true)
+
+// Strategy inputs
+show_fib_levels = input.bool(true, "Show Fibonacci Levels")
+show_breakout = input.bool(true, "Show Breakout Signals")
+show_pullback = input.bool(true, "Show Pullback Signals")
+fib_level = input.float(0.618, "Fibonacci Level", step=0.001)
+
+// SMA inputs
+sma_fast = input.int(50, "Fast SMA Period")
+sma_slow = input.int(200, "Slow SMA Period")
+
+// Higher timeframe resolution (4H)
+htf_resolution = input.timeframe("240", "Higher Timeframe (4H)")
+
+// Calculate SMAs
+sma50 = ta.sma(close, sma_fast)
+sma200 = ta.sma(close, sma_slow)
+
+// Determine trend direction based on SMA position
+bullish_trend = sma50 > sma200
+bearish_trend = sma50 < sma200
+
+// Function to get highest and lowest for Fibonacci calculation
+get_fib_levels(src, length) =>
+    highest_val = ta.highest(src, length)
+    lowest_val = ta.lowest(src, length)
+    fib_618 = lowest_val + (highest_val - lowest_val) * fib_level
+    [highest_val, lowest_val, fib_618]
+
+// 15-minute timeframe calculations (current chart)
+[high_15m, low_15m, fib_618_15m] = get_fib_levels(close, 50)
+
+// 4-hour timeframe calculations
+[high_4h, low_4h, fib_618_4h] = request.security(syminfo.tickerid, htf_resolution, get_fib_levels(close, 50))
+
+// Detect breakout conditions
+breakout_15m = ta.crossover(close, fib_618_15m)
+breakout_4h = ta.crossover(close, fib_618_4h)
+
+// Detect pullback conditions
+pullback_15m = ta.crossunder(close, fib_618_15m) and close[1] > fib_618_15m[1]
+pullback_4h = ta.crossunder(close, fib_618_4h) and close[1] > fib_618_4h[1]
+
+// Combined conditions with SMA trend confirmation
+// BUY Signals (only in bullish trend)
+buy_signal_15m = breakout_15m and bullish_trend
+buy_signal_4h = breakout_4h and bullish_trend
+buy_signal_both = (breakout_15m and breakout_4h) and bullish_trend
+buy_pullback_15m = pullback_15m and bullish_trend
+buy_pullback_4h = pullback_4h and bullish_trend
+buy_pullback_both = (pullback_15m and pullback_4h) and bullish_trend
+
+// SELL Signals (only in bearish trend)
+sell_signal_15m = breakout_15m and bearish_trend
+sell_signal_4h = breakout_4h and bearish_trend
+sell_signal_both = (breakout_15m and breakout_4h) and bearish_trend
+sell_pullback_15m = pullback_15m and bearish_trend
+sell_pullback_4h = pullback_4h and bearish_trend
+sell_pullback_both = (pullback_15m and pullback_4h) and bearish_trend
+
+// Conditional plotting variables
+plot_breakout_15m = show_breakout ? breakout_15m : bool(na)
+plot_breakout_4h = show_breakout ? breakout_4h : bool(na)
+plot_both_breakout = show_breakout ? (breakout_15m and breakout_4h) : bool(na)
+
+plot_pullback_15m = show_pullback ? pullback_15m : bool(na)
+plot_pullback_4h = show_pullback ? pullback_4h : bool(na)
+plot_both_pullback = show_pullback ? (pullback_15m and pullback_4h) : bool(na)
+
+// Plot Fibonacci levels (optional, semi-transparent)
+fib_15m_color = show_fib_levels ? color.new(color.blue, 70) : na
+fib_4h_color = show_fib_levels ? color.new(color.red, 70) : na
+
+plot(fib_618_15m, color=fib_15m_color, linewidth=1, title="Fib 0.618 (15m)", style=plot.style_linebr)
+plot(fib_618_4h, color=fib_4h_color, linewidth=1, title="Fib 0.618 (4H)", style=plot.style_linebr)
+
+// Plot SMAs (the only lines)
+plot(sma50, color=color.blue, linewidth=2, title="SMA 50")
+plot(sma200, color=color.red, linewidth=2, title="SMA 200")
+
+// Plot BUY signals (Green arrows - only in uptrend)
+plotshape(buy_signal_15m, style=shape.triangleup, location=location.belowbar, 
+     color=color.green, size=size.small, title="BUY 15m Breakout")
+
+plotshape(buy_signal_4h, style=shape.triangleup, location=location.belowbar, 
+     color=color.green, size=size.small, title="BUY 4h Breakout")
+
+plotshape(buy_signal_both, style=shape.triangleup, location=location.belowbar, 
+     color=color.green, size=size.normal, title="BUY Both TF Breakout")
+
+plotshape(buy_pullback_15m, style=shape.triangleup, location=location.belowbar, 
+     color=color.green, size=size.tiny, title="BUY 15m Pullback")
+
+plotshape(buy_pullback_4h, style=shape.triangleup, location=location.belowbar, 
+     color=color.green, size=size.tiny, title="BUY 4h Pullback")
+
+plotshape(buy_pullback_both, style=shape.triangleup, location=location.belowbar, 
+     color=color.green, size=size.small, title="BUY Both TF Pullback")
+
+// Plot SELL signals (Red arrows - only in downtrend)
+plotshape(sell_signal_15m, style=shape.triangledown, location=location.abovebar, 
+     color=color.red, size=size.small, title="SELL 15m Breakout")
+
+plotshape(sell_signal_4h, style=shape.triangledown, location=location.abovebar, 
+     color=color.red, size=size.small, title="SELL 4h Breakout")
+
+plotshape(sell_signal_both, style=shape.triangledown, location=location.abovebar, 
+     color=color.red, size=size.normal, title="SELL Both TF Breakout")
+
+plotshape(sell_pullback_15m, style=shape.triangledown, location=location.abovebar, 
+     color=color.red, size=size.tiny, title="SELL 15m Pullback")
+
+plotshape(sell_pullback_4h, style=shape.triangledown, location=location.abovebar, 
+     color=color.red, size=size.tiny, title="SELL 4h Pullback")
+
+plotshape(sell_pullback_both, style=shape.triangledown, location=location.abovebar, 
+     color=color.red, size=size.small, title="SELL Both TF Pullback")
+
+// FIXED: Using alert() instead of alertcondition() for dynamic messages
+// BUY alerts with JSON data
+if buy_signal_15m
+    alert('{"type":"BUY","signal":"15m_breakout","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"sma50":' + str.tostring(sma50) + ',"sma200":' + str.tostring(sma200) + ',"fib_15m":' + str.tostring(fib_618_15m) + ',"fib_4h":' + str.tostring(fib_618_4h) + ',"trend":"bullish","timestamp":' + str.tostring(timenow) + '}', alert.freq_once_per_bar)
+
+if buy_signal_4h
+    alert('{"type":"BUY","signal":"4h_breakout","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"sma50":' + str.tostring(sma50) + ',"sma200":' + str.tostring(sma200) + ',"fib_15m":' + str.tostring(fib_618_15m) + ',"fib_4h":' + str.tostring(fib_618_4h) + ',"trend":"bullish","timestamp":' + str.tostring(timenow) + '}', alert.freq_once_per_bar)
+
+if buy_signal_both
+    alert('{"type":"BUY","signal":"both_breakout","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"sma50":' + str.tostring(sma50) + ',"sma200":' + str.tostring(sma200) + ',"fib_15m":' + str.tostring(fib_618_15m) + ',"fib_4h":' + str.tostring(fib_618_4h) + ',"trend":"bullish","timestamp":' + str.tostring(timenow) + '}', alert.freq_once_per_bar)
+
+if buy_pullback_15m
+    alert('{"type":"BUY","signal":"15m_pullback","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"sma50":' + str.tostring(sma50) + ',"sma200":' + str.tostring(sma200) + ',"fib_15m":' + str.tostring(fib_618_15m) + ',"fib_4h":' + str.tostring(fib_618_4h) + ',"trend":"bullish","timestamp":' + str.tostring(timenow) + '}', alert.freq_once_per_bar)
+
+if buy_pullback_4h
+    alert('{"type":"BUY","signal":"4h_pullback","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"sma50":' + str.tostring(sma50) + ',"sma200":' + str.tostring(sma200) + ',"fib_15m":' + str.tostring(fib_618_15m) + ',"fib_4h":' + str.tostring(fib_618_4h) + ',"trend":"bullish","timestamp":' + str.tostring(timenow) + '}', alert.freq_once_per_bar)
+
+if buy_pullback_both
+    alert('{"type":"BUY","signal":"both_pullback","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"sma50":' + str.tostring(sma50) + ',"sma200":' + str.tostring(sma200) + ',"fib_15m":' + str.tostring(fib_618_15m) + ',"fib_4h":' + str.tostring(fib_618_4h) + ',"trend":"bullish","timestamp":' + str.tostring(timenow) + '}', alert.freq_once_per_bar)
+
+// SELL alerts with JSON data
+if sell_signal_15m
+    alert('{"type":"SELL","signal":"15m_breakout","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"sma50":' + str.tostring(sma50) + ',"sma200":' + str.tostring(sma200) + ',"fib_15m":' + str.tostring(fib_618_15m) + ',"fib_4h":' + str.tostring(fib_618_4h) + ',"trend":"bearish","timestamp":' + str.tostring(timenow) + '}', alert.freq_once_per_bar)
+
+if sell_signal_4h
+    alert('{"type":"SELL","signal":"4h_breakout","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"sma50":' + str.tostring(sma50) + ',"sma200":' + str.tostring(sma200) + ',"fib_15m":' + str.tostring(fib_618_15m) + ',"fib_4h":' + str.tostring(fib_618_4h) + ',"trend":"bearish","timestamp":' + str.tostring(timenow) + '}', alert.freq_once_per_bar)
+
+if sell_signal_both
+    alert('{"type":"SELL","signal":"both_breakout","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"sma50":' + str.tostring(sma50) + ',"sma200":' + str.tostring(sma200) + ',"fib_15m":' + str.tostring(fib_618_15m) + ',"fib_4h":' + str.tostring(fib_618_4h) + ',"trend":"bearish","timestamp":' + str.tostring(timenow) + '}', alert.freq_once_per_bar)
+
+if sell_pullback_15m
+    alert('{"type":"SELL","signal":"15m_pullback","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"sma50":' + str.tostring(sma50) + ',"sma200":' + str.tostring(sma200) + ',"fib_15m":' + str.tostring(fib_618_15m) + ',"fib_4h":' + str.tostring(fib_618_4h) + ',"trend":"bearish","timestamp":' + str.tostring(timenow) + '}', alert.freq_once_per_bar)
+
+if sell_pullback_4h
+    alert('{"type":"SELL","signal":"4h_pullback","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"sma50":' + str.tostring(sma50) + ',"sma200":' + str.tostring(sma200) + ',"fib_15m":' + str.tostring(fib_618_15m) + ',"fib_4h":' + str.tostring(fib_618_4h) + ',"trend":"bearish","timestamp":' + str.tostring(timenow) + '}', alert.freq_once_per_bar)
+
+if sell_pullback_both
+    alert('{"type":"SELL","signal":"both_pullback","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"sma50":' + str.tostring(sma50) + ',"sma200":' + str.tostring(sma200) + ',"fib_15m":' + str.tostring(fib_618_15m) + ',"fib_4h":' + str.tostring(fib_618_4h) + ',"trend":"bearish","timestamp":' + str.tostring(timenow) + '}', alert.freq_once_per_bar)
+
+// Optional: Minimal table with just essential info
+if barstate.islast
+    var table info_table = table.new(position.top_right, 2, 3, bgcolor=color.new(color.gray, 90), border_width=1)
+    
+    table.cell(info_table, 0, 0, "Trend", text_color=color.white)
+    table.cell(info_table, 1, 0, bullish_trend ? "BULLISH" : "BEARISH", text_color=bullish_trend ? color.green : color.red)
+    
+    table.cell(info_table, 0, 1, "SMA 50", text_color=color.blue)
+    table.cell(info_table, 1, 1, str.tostring(math.round_to_mintick(sma50)), text_color=color.white)
+    
+    table.cell(info_table, 0, 2, "SMA 200", text_color=color.red)
+    table.cell(info_table, 1, 2, str.tostring(math.round_to_mintick(sma200)), text_color=color.white)

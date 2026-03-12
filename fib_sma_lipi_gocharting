@@ -1,0 +1,189 @@
+// GoCharting Script - MTF Fibonacci + SMA Trend Direction Strategy
+study("MTF Fibonacci + SMA Strategy", overlay=true)
+
+// Strategy inputs
+show_fib_levels = input(true, "Show Fibonacci Levels")
+show_breakout = input(true, "Show Breakout Signals")
+show_pullback = input(true, "Show Pullback Signals")
+fib_level = input(0.618, "Fibonacci Level")
+
+// SMA inputs
+sma_fast = input(50, "Fast SMA Period")
+sma_slow = input(200, "Slow SMA Period")
+
+// Calculate SMAs
+sma50 = sma(close, sma_fast)
+sma200 = sma(close, sma_slow)
+
+// Determine trend direction
+bullish_trend = sma50 > sma200
+bearish_trend = sma50 < sma200
+
+// Function to calculate Fibonacci levels
+get_fib_levels(src, length) =>
+    highest_val = highest(src, length)
+    lowest_val = lowest(src, length)
+    fib_618 = lowest_val + (highest_val - lowest_val) * fib_level
+    [highest_val, lowest_val, fib_618]
+
+// 15-minute timeframe (current)
+[high_15m, low_15m, fib_618_15m] = get_fib_levels(close, 50)
+
+// 4-hour timeframe
+[high_4h, low_4h, fib_618_4h] = security(symbol, "4h", get_fib_levels(close, 50))
+
+// Detect conditions
+breakout_15m = crossover(close, fib_618_15m)
+breakout_4h = crossover(close, fib_618_4h)
+
+pullback_15m = crossunder(close, fib_618_15m) and close[1] > fib_618_15m[1]
+pullback_4h = crossunder(close, fib_618_4h) and close[1] > fib_618_4h[1]
+
+// Combined signals
+buy_signal_15m = breakout_15m and bullish_trend
+buy_signal_4h = breakout_4h and bullish_trend
+buy_signal_both = (breakout_15m and breakout_4h) and bullish_trend
+buy_pullback_15m = pullback_15m and bullish_trend
+buy_pullback_4h = pullback_4h and bullish_trend
+buy_pullback_both = (pullback_15m and pullback_4h) and bullish_trend
+
+sell_signal_15m = breakout_15m and bearish_trend
+sell_signal_4h = breakout_4h and bearish_trend
+sell_signal_both = (breakout_15m and breakout_4h) and bearish_trend
+sell_pullback_15m = pullback_15m and bearish_trend
+sell_pullback_4h = pullback_4h and bearish_trend
+sell_pullback_both = (pullback_15m and pullback_4h) and bearish_trend
+
+// Plot Fibonacci levels
+plot(fib_618_15m, "Fib 0.618 (15m)", show_fib_levels ? "#00ffaa" : null, 1, "line")
+plot(fib_618_4h, "Fib 0.618 (4H)", show_fib_levels ? "#ffaa00" : null, 1, "line")
+
+// Plot SMAs
+plot(sma50, "SMA 50", "#0066ff", 2, "line")
+plot(sma200, "SMA 200", "#ff3300", 2, "line")
+
+// Plot signals as shapes
+plotshape(buy_signal_15m, "BUY 15m Breakout", "triangle-up", location.belowbar, "#00ff00", 10)
+plotshape(buy_signal_4h, "BUY 4h Breakout", "triangle-up", location.belowbar, "#00ff00", 10)
+plotshape(buy_signal_both, "BUY Both TF Breakout", "triangle-up", location.belowbar, "#00ff00", 14)
+plotshape(buy_pullback_15m, "BUY 15m Pullback", "triangle-up", location.belowbar, "#00ff00", 8)
+plotshape(buy_pullback_4h, "BUY 4h Pullback", "triangle-up", location.belowbar, "#00ff00", 8)
+plotshape(buy_pullback_both, "BUY Both TF Pullback", "triangle-up", location.belowbar, "#00ff00", 12)
+
+plotshape(sell_signal_15m, "SELL 15m Breakout", "triangle-down", location.abovebar, "#ff0000", 10)
+plotshape(sell_signal_4h, "SELL 4h Breakout", "triangle-down", location.abovebar, "#ff0000", 10)
+plotshape(sell_signal_both, "SELL Both TF Breakout", "triangle-down", location.abovebar, "#ff0000", 14)
+plotshape(sell_pullback_15m, "SELL 15m Pullback", "triangle-down", location.abovebar, "#ff0000", 8)
+plotshape(sell_pullback_4h, "SELL 4h Pullback", "triangle-down", location.abovebar, "#ff0000", 8)
+plotshape(sell_pullback_both, "SELL Both TF Pullback", "triangle-down", location.abovebar, "#ff0000", 12)
+
+
+// ALERTS WITH WEBHOOKS
+
+// BUY Alerts
+if (buy_signal_15m) {
+    alert("BUY Signal - 15m Breakout", "webhook", 
+        "type=BUY|signal=15m_breakout|symbol=" + symbol + 
+        "|price=" + close + "|sma50=" + sma50 + "|sma200=" + sma200 + 
+        "|fib_15m=" + fib_618_15m + "|fib_4h=" + fib_618_4h + 
+        "|trend=bullish|timestamp=" + timenow)
+}
+
+if (buy_signal_4h) {
+    alert("BUY Signal - 4h Breakout", "webhook", 
+        "type=BUY|signal=4h_breakout|symbol=" + symbol + 
+        "|price=" + close + "|sma50=" + sma50 + "|sma200=" + sma200 + 
+        "|fib_15m=" + fib_618_15m + "|fib_4h=" + fib_618_4h + 
+        "|trend=bullish|timestamp=" + timenow)
+}
+
+if (buy_signal_both) {
+    alert("BUY Signal - Both TF Breakout", "webhook", 
+        "type=BUY|signal=both_breakout|symbol=" + symbol + 
+        "|price=" + close + "|sma50=" + sma50 + "|sma200=" + sma200 + 
+        "|fib_15m=" + fib_618_15m + "|fib_4h=" + fib_618_4h + 
+        "|trend=bullish|timestamp=" + timenow)
+}
+
+if (buy_pullback_15m) {
+    alert("BUY Signal - 15m Pullback", "webhook", 
+        "type=BUY|signal=15m_pullback|symbol=" + symbol + 
+        "|price=" + close + "|sma50=" + sma50 + "|sma200=" + sma200 + 
+        "|fib_15m=" + fib_618_15m + "|fib_4h=" + fib_618_4h + 
+        "|trend=bullish|timestamp=" + timenow)
+}
+
+if (buy_pullback_4h) {
+    alert("BUY Signal - 4h Pullback", "webhook", 
+        "type=BUY|signal=4h_pullback|symbol=" + symbol + 
+        "|price=" + close + "|sma50=" + sma50 + "|sma200=" + sma200 + 
+        "|fib_15m=" + fib_618_15m + "|fib_4h=" + fib_618_4h + 
+        "|trend=bullish|timestamp=" + timenow)
+}
+
+if (buy_pullback_both) {
+    alert("BUY Signal - Both TF Pullback", "webhook", 
+        "type=BUY|signal=both_pullback|symbol=" + symbol + 
+        "|price=" + close + "|sma50=" + sma50 + "|sma200=" + sma200 + 
+        "|fib_15m=" + fib_618_15m + "|fib_4h=" + fib_618_4h + 
+        "|trend=bullish|timestamp=" + timenow)
+}
+
+// SELL Alerts
+if (sell_signal_15m) {
+    alert("SELL Signal - 15m Breakout", "webhook", 
+        "type=SELL|signal=15m_breakout|symbol=" + symbol + 
+        "|price=" + close + "|sma50=" + sma50 + "|sma200=" + sma200 + 
+        "|fib_15m=" + fib_618_15m + "|fib_4h=" + fib_618_4h + 
+        "|trend=bearish|timestamp=" + timenow)
+}
+
+if (sell_signal_4h) {
+    alert("SELL Signal - 4h Breakout", "webhook", 
+        "type=SELL|signal=4h_breakout|symbol=" + symbol + 
+        "|price=" + close + "|sma50=" + sma50 + "|sma200=" + sma200 + 
+        "|fib_15m=" + fib_618_15m + "|fib_4h=" + fib_618_4h + 
+        "|trend=bearish|timestamp=" + timenow)
+}
+
+if (sell_signal_both) {
+    alert("SELL Signal - Both TF Breakout", "webhook", 
+        "type=SELL|signal=both_breakout|symbol=" + symbol + 
+        "|price=" + close + "|sma50=" + sma50 + "|sma200=" + sma200 + 
+        "|fib_15m=" + fib_618_15m + "|fib_4h=" + fib_618_4h + 
+        "|trend=bearish|timestamp=" + timenow)
+}
+
+if (sell_pullback_15m) {
+    alert("SELL Signal - 15m Pullback", "webhook", 
+        "type=SELL|signal=15m_pullback|symbol=" + symbol + 
+        "|price=" + close + "|sma50=" + sma50 + "|sma200=" + sma200 + 
+        "|fib_15m=" + fib_618_15m + "|fib_4h=" + fib_618_4h + 
+        "|trend=bearish|timestamp=" + timenow)
+}
+
+if (sell_pullback_4h) {
+    alert("SELL Signal - 4h Pullback", "webhook", 
+        "type=SELL|signal=4h_pullback|symbol=" + symbol + 
+        "|price=" + close + "|sma50=" + sma50 + "|sma200=" + sma200 + 
+        "|fib_15m=" + fib_618_15m + "|fib_4h=" + fib_618_4h + 
+        "|trend=bearish|timestamp=" + timenow)
+}
+
+if (sell_pullback_both) {
+    alert("SELL Signal - Both TF Pullback", "webhook", 
+        "type=SELL|signal=both_pullback|symbol=" + symbol + 
+        "|price=" + close + "|sma50=" + sma50 + "|sma200=" + sma200 + 
+        "|fib_15m=" + fib_618_15m + "|fib_4h=" + fib_618_4h + 
+        "|trend=bearish|timestamp=" + timenow)
+}
+
+// Create info table
+let tableData = {
+    trend: bullish_trend ? "BULLISH" : "BEARISH",
+    sma50: sma50.toFixed(2),
+    sma200: sma200.toFixed(2)
+}
+
+// Background color for trend
+bgcolor(bullish_trend ? "#00ff0011" : "#ff000011")

@@ -1,0 +1,23 @@
+# render.yaml - Configuration for Python Trading Bot only
+
+services:
+  # Cron Job for the Python Trading Bot
+  - type: cron
+    name: fib-trading-bot
+    runtime: python
+    repo: https://github.com/yourusername/fib-trading-bot
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python fib_sma_bot.py
+    schedule: "*/30 * * * *"  # Runs every 30 minutes
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.18
+      - key: RAPIDAPI_KEY
+        sync: false  # You'll set this manually in Render dashboard
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false  # You'll set this manually in Render dashboard
+      - key: RENDER
+        value: true  # Let's the bot know it's running on Render
+      - key: PYTHONUNBUFFERED
+        value: 1  # Ensures logs are output immediately

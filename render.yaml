@@ -5,7 +5,7 @@ services:
   - type: cron
     name: fib-trading-bot
     runtime: python
-    repo: https://github.com/yourusername/fib-trading-bot
+    repo: https://github.com/didierdrin/fib-trading-bot
     branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: python fib_sma_bot.py

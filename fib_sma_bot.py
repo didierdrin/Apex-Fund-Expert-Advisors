@@ -419,4 +419,44 @@ if __name__ == "__main__":
     else:  # Running locally
         print("💻 Running locally - Continuous mode")
         bot.run_continuously()
-        
+
+# Add this at the end of your fib_sma_bot.py
+import flask
+from flask import Flask, jsonify
+import threading
+import time
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return jsonify({
+        'status': 'running',
+        'last_check': last_check_time,
+        'total_signals': total_signals,
+        'requests_used': bot.request_count
+    })
+
+@app.route('/health')
+def health():
+    return 'OK', 200
+
+def run_bot():
+    global last_check_time, total_signals, bot
+    while True:
+        bot.scan_watchlist()
+        last_check_time = datetime.now().isoformat()
+        total_signals += 1
+        time.sleep(1800)  # 30 minutes
+
+if __name__ == "__main__":
+    # Start bot in background thread
+    bot = FibSMATradingBot(os.environ.get('RAPIDAPI_KEY'))
+    last_check_time = None
+    total_signals = 0
+    
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    
+    # Run web server
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))

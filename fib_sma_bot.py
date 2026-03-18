@@ -10,6 +10,16 @@ import pandas as pd
 import numpy as np
 import firebase_admin
 from firebase_admin import credentials, firestore
+from flask import Flask, jsonify
+import threading
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Global variables for bot status
+bot_instance = None
+last_check_time = None
+total_signals = 0
 
 class FibSMATradingBot:
     def __init__(self, api_key):
@@ -36,61 +46,60 @@ class FibSMATradingBot:
         
         # Session times (UTC)
         self.sessions = {
-            'asia': {'open': 23, 'close': 8, 'name': 'Asian Session'},      # 11 PM UTC - 8 AM UTC
-            'london': {'open': 7, 'close': 16, 'name': 'London Session'},    # 7 AM UTC - 4 PM UTC
-            'newyork': {'open': 13, 'close': 22, 'name': 'New York Session'} # 1 PM UTC - 10 PM UTC
+            'asia': {'open': 23, 'close': 8, 'name': 'Asian Session'},
+            'london': {'open': 7, 'close': 16, 'name': 'London Session'},
+            'newyork': {'open': 13, 'close': 22, 'name': 'New York Session'}
         }
         
         # Trading parameters
         self.check_interval = 30  # minutes
-        self.session_active_hours = 3  # Check for 3 hours after session open
-        self.timeframe = '15m'  # Using 15-minute timeframe
+        self.session_active_hours = 3
+        self.timeframe = '15m'
         
-        # Initialize Firebase
-        self.init_firebase()
+        # Initialize Firebase (only once)
+        self.db = self.init_firebase()
     
     def init_firebase(self):
-        """Initialize Firebase connection"""
+        """Initialize Firebase connection - only once"""
         try:
-            # Check if we have the service account in environment variable
-            if 'FIREBASE_SERVICE_ACCOUNT' in os.environ:
-                print("🔑 Using Firebase service account from environment variable")
-                # Decode from base64
-                service_account_json = base64.b64decode(
-                    os.environ['FIREBASE_SERVICE_ACCOUNT']
-                ).decode('utf-8')
+            # Check if Firebase is already initialized
+            if not firebase_admin._apps:
+                print("🔑 Initializing Firebase...")
                 
-                # Create a temporary file
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                    f.write(service_account_json)
-                    temp_path = f.name
-                
-                cred = credentials.Certificate(temp_path)
-                firebase_admin.initialize_app(cred)
-                
-                # Clean up temp file
-                os.unlink(temp_path)
-                
-            else:
-                # Fallback to local file
-                print("📁 Using local serviceAccountKey.json file")
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                service_account_path = os.path.join(script_dir, 'serviceAccountKey.json')
-                
-                if not os.path.exists(service_account_path):
-                    print(f"⚠️ Service account file not found at: {service_account_path}")
-                    print("Current directory:", os.getcwd())
-                    print("Files in directory:", os.listdir(script_dir))
+                # Check if we have the service account in environment variable
+                if 'FIREBASE_SERVICE_ACCOUNT' in os.environ:
+                    # Decode from base64
+                    service_account_json = base64.b64decode(
+                        os.environ['FIREBASE_SERVICE_ACCOUNT']
+                    ).decode('utf-8')
                     
-                cred = credentials.Certificate(service_account_path)
-                firebase_admin.initialize_app(cred)
+                    # Create a temporary file
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                        f.write(service_account_json)
+                        temp_path = f.name
+                    
+                    cred = credentials.Certificate(temp_path)
+                    firebase_admin.initialize_app(cred)
+                    
+                    # Clean up temp file
+                    os.unlink(temp_path)
+                    print("✅ Firebase initialized from environment variable")
+                    
+                else:
+                    # Fallback to local file
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    service_account_path = os.path.join(script_dir, 'serviceAccountKey.json')
+                    cred = credentials.Certificate(service_account_path)
+                    firebase_admin.initialize_app(cred)
+                    print("✅ Firebase initialized from local file")
+            else:
+                print("✅ Firebase already initialized, reusing existing instance")
             
-            self.db = firestore.client()
-            print("✅ Firebase initialized successfully")
+            return firestore.client()
             
         except Exception as e:
             print(f"❌ Error initializing Firebase: {e}")
-            self.db = None
+            return None
     
     def save_alert_to_firebase(self, alert_data):
         """Save alert to Firebase Firestore"""
@@ -125,7 +134,6 @@ class FibSMATradingBot:
             open_hour = session['open']
             close_hour = session['close']
             
-            # Handle overnight sessions
             if close_hour < open_hour:
                 if current_hour >= open_hour or current_hour < close_hour:
                     return session_id
@@ -136,26 +144,21 @@ class FibSMATradingBot:
         return 'off_hours'
     
     def is_trading_time(self):
-        """Check if current time is within trading window (3 hours after session open)"""
+        """Check if current time is within trading window"""
         now_utc = datetime.utcnow()
         current_hour = now_utc.hour
         current_minute = now_utc.minute
         
         for session_id, session in self.sessions.items():
             open_hour = session['open']
-            
-            # Calculate the time window (3 hours after session open)
-            window_start = open_hour
             window_end = (open_hour + self.session_active_hours) % 24
             
-            # Handle day wrap
-            if window_end < window_start:
-                if current_hour >= window_start or current_hour < window_end:
-                    # Check if we're within the 30-minute check interval
-                    if current_minute % self.check_interval < 15:  # Check at :00 and :30
+            if window_end < open_hour:
+                if current_hour >= open_hour or current_hour < window_end:
+                    if current_minute % self.check_interval < 15:
                         return True, session_id
             else:
-                if window_start <= current_hour < window_end:
+                if open_hour <= current_hour < window_end:
                     if current_minute % self.check_interval < 15:
                         return True, session_id
         
@@ -215,41 +218,29 @@ class FibSMATradingBot:
     
     def check_signals(self, symbol, prices):
         """Check for trading signals on 15min timeframe"""
-        if len(prices) < 200:  # Need enough data for SMAs (200 periods on 15min = ~2 days)
+        if len(prices) < 200:
             return None
         
-        # Calculate indicators
-        sma50 = self.calculate_sma(prices, 50)    # 50 periods on 15min = ~12.5 hours
-        sma200 = self.calculate_sma(prices, 200)  # 200 periods on 15min = ~2 days
-        fib_data = self.calculate_fib_levels(prices, 100)  # 100 periods on 15min = 1 day for fib levels
+        sma50 = self.calculate_sma(prices, 50)
+        sma200 = self.calculate_sma(prices, 200)
+        fib_data = self.calculate_fib_levels(prices, 100)
         
         if not all([sma50, sma200, fib_data]):
             return None
             
         current_price = prices[-1]
         prev_price = prices[-2]
-        prev_5_prices = prices[-6:-1]  # Last 5 candles before current
+        prev_5_prices = prices[-6:-1]
         
-        # Determine trend
         bullish_trend = sma50 > sma200
         bearish_trend = sma50 < sma200
         
-        # Check for strong trend (SMA slope)
-        sma50_slope = sma50 - self.calculate_sma(prices, 50) if len(prices) > 51 else 0
-        
         signals = []
-        
-        # Breakout conditions
         fib_breakout = prev_price <= fib_data['fib_618'] and current_price > fib_data['fib_618']
-        
-        # Pullback conditions (price touched fib level and bounced)
         fib_touched = any(abs(p - fib_data['fib_618']) / fib_data['fib_618'] < 0.001 for p in prev_5_prices)
         fib_pullback = fib_touched and abs(current_price - fib_data['fib_618']) / fib_data['fib_618'] > 0.002
+        strong_move = abs(current_price - prev_price) / prev_price > 0.001
         
-        # Volume-like confirmation using price action
-        strong_move = abs(current_price - prev_price) / prev_price > 0.001  # 0.1% move
-        
-        # Generate signals based on trend
         if bullish_trend and strong_move:
             if fib_breakout:
                 signals.append({
@@ -259,7 +250,7 @@ class FibSMATradingBot:
                     'fib_level': fib_data['fib_618'],
                     'sma50': sma50,
                     'sma200': sma200,
-                    'confidence': 'HIGH' if sma50_slope > 0 else 'MEDIUM'
+                    'confidence': 'HIGH'
                 })
             elif fib_pullback:
                 signals.append({
@@ -281,7 +272,7 @@ class FibSMATradingBot:
                     'fib_level': fib_data['fib_618'],
                     'sma50': sma50,
                     'sma200': sma200,
-                    'confidence': 'HIGH' if sma50_slope < 0 else 'MEDIUM'
+                    'confidence': 'HIGH'
                 })
             elif fib_pullback:
                 signals.append({
@@ -297,13 +288,15 @@ class FibSMATradingBot:
         return signals
     
     def scan_watchlist(self):
-        """Main scanning function - runs on schedule"""
+        """Main scanning function"""
+        global last_check_time, total_signals
+        
         print(f"\n{'='*60}")
         print(f"🚀 Scan started at {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
         print(f"{'='*60}")
         
-        # Check if it's trading time
         is_trading_time, current_session = self.is_trading_time()
+        last_check_time = datetime.now().isoformat()
         
         if not is_trading_time:
             print(f"⏰ Not in trading window. Next check at {(datetime.utcnow() + timedelta(minutes=30)).strftime('%H:%M')} UTC")
@@ -319,13 +312,10 @@ class FibSMATradingBot:
                 break
             
             print(f"\n🔍 Checking {symbol}...")
-            
-            # Get 15min historical data
             hist_data = self.get_historical_data(symbol, interval='15m', range='2d')
             
             if hist_data and 'chart' in hist_data:
                 try:
-                    # Extract closing prices
                     prices = []
                     if 'result' in hist_data['chart'] and len(hist_data['chart']['result']) > 0:
                         result = hist_data['chart']['result'][0]
@@ -339,18 +329,16 @@ class FibSMATradingBot:
                         
                         if signals:
                             for signal in signals:
-                                # Add session context
                                 signal['timeframe'] = '15m'
                                 signal['session'] = current_session
                                 
-                                # Save to Firebase
                                 self.save_alert_to_firebase({
                                     'symbol': symbol,
                                     **signal
                                 })
                                 signals_found += 1
+                                total_signals += 1
                                 
-                                # Print to console
                                 print(f"\n🎯 SIGNAL FOUND: {symbol}")
                                 print(f"   Type: {signal['type']} - {signal['signal']}")
                                 print(f"   Price: ${signal['price']:.4f}")
@@ -363,100 +351,83 @@ class FibSMATradingBot:
                 except Exception as e:
                     print(f"❌ Error processing {symbol}: {e}")
             
-            # Rate limiting
             time.sleep(1.5)
         
         print(f"\n{'='*60}")
         print(f"✅ Scan completed! Found {signals_found} signals")
         print(f"📊 API Requests used: {self.request_count}/{self.max_requests}")
-        print(f"🕒 Next check at {(datetime.utcnow() + timedelta(minutes=30)).strftime('%H:%M')} UTC")
         print(f"{'='*60}")
-    
-    def run_continuously(self):
-        """Run the bot continuously with 30-minute intervals"""
-        print("🤖 Starting Fib SMA Trading Bot - Continuous Mode")
-        print(f"📈 Timeframe: {self.timeframe}")
-        print(f"⏰ Checking every {self.check_interval} minutes during active sessions")
-        print(f"🎯 Active trading windows: 3 hours after each major session open")
-        print("\nSession Times (UTC):")
-        for session_id, session in self.sessions.items():
-            print(f"   {session['name']}: {session['open']:02d}:00 - {session['close']:02d}:00 UTC")
-        
-        print("\n🚀 Bot is now running... Press Ctrl+C to stop\n")
-        
-        try:
-            while True:
-                # Run scan
-                self.scan_watchlist()
-                
-                # Calculate next check time
-                next_check = datetime.utcnow() + timedelta(minutes=self.check_interval)
-                print(f"\n💤 Sleeping until {next_check.strftime('%H:%M')} UTC...\n")
-                
-                # Sleep for 30 minutes
-                time.sleep(self.check_interval * 60)
-                
-        except KeyboardInterrupt:
-            print("\n\n👋 Bot stopped by user")
-            print(f"📊 Total API requests used: {self.request_count}")
 
-# Main execution
-if __name__ == "__main__":
-    print("🚀 Initializing Fib SMA Trading Bot...")
-    print(f"Python version: {sys.version}")
-    print(f"Current UTC time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}")
-    
-    # Get API key from environment variable or use default
-    API_KEY = os.environ.get('RAPIDAPI_KEY', '93e69d4612mshb9882c64196bebap186e1ajsn4e3c4ca3b804')
-    
-    # Create bot instance
-    bot = FibSMATradingBot(API_KEY)
-    
-    # Check if running on Render (cron) or locally
-    if os.environ.get('RENDER'):  # Running on Render
-        print("🎯 Running on Render - Single scan mode")
-        bot.scan_watchlist()
-    else:  # Running locally
-        print("💻 Running locally - Continuous mode")
-        bot.run_continuously()
-
-# Add this at the end of your fib_sma_bot.py
-import flask
-from flask import Flask, jsonify
-import threading
-import time
-
-app = Flask(__name__)
-
+# Flask routes for health checks and status
 @app.route('/')
 def home():
     return jsonify({
         'status': 'running',
         'last_check': last_check_time,
         'total_signals': total_signals,
-        'requests_used': bot.request_count
+        'requests_used': bot_instance.request_count if bot_instance else 0
     })
 
 @app.route('/health')
 def health():
     return 'OK', 200
 
+@app.route('/status')
+def status():
+    """Detailed status endpoint"""
+    if not bot_instance:
+        return jsonify({'error': 'Bot not initialized'}), 500
+    
+    current_session = bot_instance.get_current_session()
+    is_trading, active_session = bot_instance.is_trading_time()
+    
+    return jsonify({
+        'status': 'running',
+        'current_time_utc': datetime.utcnow().isoformat(),
+        'current_session': current_session,
+        'is_trading_time': is_trading,
+        'active_session': active_session if is_trading else None,
+        'last_check': last_check_time,
+        'total_signals': total_signals,
+        'requests_used': bot_instance.request_count,
+        'requests_remaining': bot_instance.max_requests - bot_instance.request_count,
+        'watchlist': bot_instance.watchlist
+    })
+
 def run_bot():
-    global last_check_time, total_signals, bot
+    """Run the bot in a background thread"""
+    global bot_instance
     while True:
-        bot.scan_watchlist()
-        last_check_time = datetime.now().isoformat()
-        total_signals += 1
-        time.sleep(1800)  # 30 minutes
+        try:
+            bot_instance.scan_watchlist()
+        except Exception as e:
+            print(f"❌ Error in bot scan: {e}")
+        
+        # Sleep for 30 minutes
+        time.sleep(1800)
 
 if __name__ == "__main__":
-    # Start bot in background thread
-    bot = FibSMATradingBot(os.environ.get('RAPIDAPI_KEY'))
-    last_check_time = None
-    total_signals = 0
+    print("🚀 Initializing Fib SMA Trading Bot...")
+    print(f"Python version: {sys.version}")
+    print(f"Current UTC time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}")
     
+    # Get API key from environment variable
+    API_KEY = os.environ.get('RAPIDAPI_KEY')
+    if not API_KEY:
+        print("❌ RAPIDAPI_KEY environment variable not set!")
+        sys.exit(1)
+    
+    # Create bot instance
+    bot_instance = FibSMATradingBot(API_KEY)
+    
+    # Start bot in background thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
+    print("✅ Bot thread started")
     
-    # Run web server
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+    # Get port from environment (Render sets this automatically)
+    port = int(os.environ.get('PORT', 10000))
+    print(f"🚀 Starting web server on port {port}")
+    
+    # Run Flask app
+    app.run(host='0.0.0.0', port=port)

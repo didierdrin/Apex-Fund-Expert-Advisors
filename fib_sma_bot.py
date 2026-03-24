@@ -54,7 +54,30 @@ class FibSMATradingBot:
         # Trading parameters
         self.check_interval = 30  # minutes
         self.session_active_hours = 3
-        self.timeframe = '15m'
+        self.timeframe = '1h'
+        self.htf_timeframe = '4h'
+        self.data_range = '1mo'
+        self.htf_data_range = '3mo'
+
+        # Stationarity strategy parameters (translated from Pine Script)
+        self.lookback = 50
+        self.stationarity_threshold = 0.05
+        self.zscore_threshold = 1.5
+        self.trend_ma_period = 20
+        self.sma_slope_period = 5
+        self.max_sma_slope_percent = 0.25
+        self.min_sma_distance_ticks = 500
+
+        # Approximate min tick by symbol for SMA-distance filter
+        self.symbol_min_tick = {
+            'GBPJPY=X': 0.01,
+            'XAUUSD=X': 0.01,
+            'USDCAD=X': 0.0001,
+            'BTC-USD': 0.01,
+            'EURUSD=X': 0.0001,
+            'GBPUSD=X': 0.0001,
+            'USDJPY=X': 0.01
+        }
         
         # Initialize Firebase (only once)
         self.db = self.init_firebase()
@@ -193,98 +216,123 @@ class FibSMATradingBot:
             print(f"❌ Error fetching history for {symbol}: {e}")
         return None
     
-    def calculate_sma(self, prices, period):
-        """Calculate Simple Moving Average"""
-        if len(prices) < period:
-            return None
-        return sum(prices[-period:]) / period
-    
-    def calculate_fib_levels(self, prices, period=50, fib_level=0.618):
-        """Calculate Fibonacci levels"""
-        if len(prices) < period:
-            return None
-            
-        recent_prices = prices[-period:]
-        highest = max(recent_prices)
-        lowest = min(recent_prices)
-        fib_618 = lowest + (highest - lowest) * fib_level
-        
-        return {
-            'highest': highest,
-            'lowest': lowest,
-            'fib_618': fib_618,
-            'range': highest - lowest
-        }
-    
-    def check_signals(self, symbol, prices):
-        """Check for trading signals on 15min timeframe"""
-        if len(prices) < 200:
-            return None
-        
-        sma50 = self.calculate_sma(prices, 50)
-        sma200 = self.calculate_sma(prices, 200)
-        fib_data = self.calculate_fib_levels(prices, 100)
-        
-        if not all([sma50, sma200, fib_data]):
-            return None
-            
-        current_price = prices[-1]
-        prev_price = prices[-2]
-        prev_5_prices = prices[-6:-1]
-        
+    def extract_close_prices(self, hist_data):
+        """Extract valid close prices from Yahoo chart response."""
+        prices = []
+        if hist_data and 'chart' in hist_data:
+            if 'result' in hist_data['chart'] and len(hist_data['chart']['result']) > 0:
+                result = hist_data['chart']['result'][0]
+                if 'indicators' in result and 'quote' in result['indicators']:
+                    quotes = result['indicators']['quote'][0]
+                    if 'close' in quotes:
+                        prices = [p for p in quotes['close'] if p is not None]
+        return prices
+
+    def check_signals(self, symbol, prices, htf_prices):
+        """Check stationarity strategy signals on H1 timeframe."""
+        min_required = max(200, self.lookback, 50 + self.sma_slope_period)
+        if len(prices) < min_required or len(htf_prices) < self.trend_ma_period:
+            return []
+
+        closes = pd.Series(prices, dtype='float64')
+        htf_closes = pd.Series(htf_prices, dtype='float64')
+
+        # Stationarity placeholder from Pine script
+        p_value = 0.01
+        is_stationary = p_value < self.stationarity_threshold
+        if not is_stationary:
+            return []
+
+        sma_lookback_series = closes.rolling(window=self.lookback).mean()
+        stddev_lookback_series = closes.rolling(window=self.lookback).std(ddof=0)
+        sma50_series = closes.rolling(window=50).mean()
+        sma200_series = closes.rolling(window=200).mean()
+        htf_sma_series = htf_closes.rolling(window=self.trend_ma_period).mean()
+
+        sma_lookback = sma_lookback_series.iloc[-1]
+        stddev_lookback = stddev_lookback_series.iloc[-1]
+        sma50 = sma50_series.iloc[-1]
+        sma200 = sma200_series.iloc[-1]
+        prev_sma50 = sma50_series.iloc[-1 - self.sma_slope_period]
+        htf_close = htf_closes.iloc[-1]
+        htf_sma = htf_sma_series.iloc[-1]
+        current_price = closes.iloc[-1]
+
+        if any(pd.isna(v) for v in [sma_lookback, stddev_lookback, sma50, sma200, prev_sma50, htf_sma]):
+            return []
+        if stddev_lookback == 0 or prev_sma50 == 0:
+            return []
+
+        zscore = (current_price - sma_lookback) / stddev_lookback
+
+        htf_trend_bullish = htf_close > htf_sma
+        htf_trend_bearish = htf_close < htf_sma
         bullish_trend = sma50 > sma200
         bearish_trend = sma50 < sma200
-        
+
+        sma50_pct_change = ((sma50 - prev_sma50) / prev_sma50) * 100
+        sma_slope_ok = abs(sma50_pct_change) <= self.max_sma_slope_percent
+
+        min_tick = self.symbol_min_tick.get(symbol, 0.0001)
+        sma_distance_ticks = abs(sma50 - sma200) / min_tick
+        sma_distance_ok = sma_distance_ticks >= self.min_sma_distance_ticks
+
+        bullish_valid = bullish_trend and sma_distance_ok and sma_slope_ok
+        bearish_valid = bearish_trend and sma_distance_ok and sma_slope_ok
+
+        base_entry_long = is_stationary and zscore < -self.zscore_threshold and htf_trend_bullish
+        base_entry_short = is_stationary and zscore > self.zscore_threshold and htf_trend_bearish
+        base_exit_long = zscore > self.zscore_threshold
+        base_exit_short = zscore < -self.zscore_threshold
+
+        entry_long = base_entry_long and bullish_valid
+        entry_short = base_entry_short and bearish_valid
+        exit_long = base_exit_long and bearish_valid
+        exit_short = base_exit_short and bullish_valid
+
         signals = []
-        fib_breakout = prev_price <= fib_data['fib_618'] and current_price > fib_data['fib_618']
-        fib_touched = any(abs(p - fib_data['fib_618']) / fib_data['fib_618'] < 0.001 for p in prev_5_prices)
-        fib_pullback = fib_touched and abs(current_price - fib_data['fib_618']) / fib_data['fib_618'] > 0.002
-        strong_move = abs(current_price - prev_price) / prev_price > 0.001
-        
-        if bullish_trend and strong_move:
-            if fib_breakout:
-                signals.append({
-                    'type': 'BUY',
-                    'signal': '15m_breakout',
-                    'price': current_price,
-                    'fib_level': fib_data['fib_618'],
-                    'sma50': sma50,
-                    'sma200': sma200,
-                    'confidence': 'HIGH'
-                })
-            elif fib_pullback:
-                signals.append({
-                    'type': 'BUY',
-                    'signal': '15m_pullback',
-                    'price': current_price,
-                    'fib_level': fib_data['fib_618'],
-                    'sma50': sma50,
-                    'sma200': sma200,
-                    'confidence': 'MEDIUM'
-                })
-        
-        elif bearish_trend and strong_move:
-            if fib_breakout:
-                signals.append({
-                    'type': 'SELL',
-                    'signal': '15m_breakout',
-                    'price': current_price,
-                    'fib_level': fib_data['fib_618'],
-                    'sma50': sma50,
-                    'sma200': sma200,
-                    'confidence': 'HIGH'
-                })
-            elif fib_pullback:
-                signals.append({
-                    'type': 'SELL',
-                    'signal': '15m_pullback',
-                    'price': current_price,
-                    'fib_level': fib_data['fib_618'],
-                    'sma50': sma50,
-                    'sma200': sma200,
-                    'confidence': 'MEDIUM'
-                })
-        
+        if entry_long:
+            signals.append({
+                'type': 'BUY',
+                'signal': 'h1_stationarity_entry_long',
+                'price': float(current_price),
+                'confidence': 'HIGH'
+            })
+        if entry_short:
+            signals.append({
+                'type': 'SELL',
+                'signal': 'h1_stationarity_entry_short',
+                'price': float(current_price),
+                'confidence': 'HIGH'
+            })
+        if exit_long:
+            signals.append({
+                'type': 'EXIT_LONG',
+                'signal': 'h1_stationarity_exit_long',
+                'price': float(current_price),
+                'confidence': 'MEDIUM'
+            })
+        if exit_short:
+            signals.append({
+                'type': 'EXIT_SHORT',
+                'signal': 'h1_stationarity_exit_short',
+                'price': float(current_price),
+                'confidence': 'MEDIUM'
+            })
+
+        indicator_context = {
+            'zscore': float(zscore),
+            'stationarity_p_value': float(p_value),
+            'sma50': float(sma50),
+            'sma200': float(sma200),
+            'sma50_slope_pct': float(sma50_pct_change),
+            'sma_distance_ticks': float(sma_distance_ticks),
+            'htf_sma': float(htf_sma),
+            'htf_close': float(htf_close)
+        }
+        for s in signals:
+            s.update(indicator_context)
+
         return signals
     
     def scan_watchlist(self):
@@ -312,24 +360,20 @@ class FibSMATradingBot:
                 break
             
             print(f"\n🔍 Checking {symbol}...")
-            hist_data = self.get_historical_data(symbol, interval='15m', range='2d')
-            
-            if hist_data and 'chart' in hist_data:
+            hist_data = self.get_historical_data(symbol, interval=self.timeframe, range=self.data_range)
+            htf_data = self.get_historical_data(symbol, interval=self.htf_timeframe, range=self.htf_data_range)
+
+            if hist_data and htf_data:
                 try:
-                    prices = []
-                    if 'result' in hist_data['chart'] and len(hist_data['chart']['result']) > 0:
-                        result = hist_data['chart']['result'][0]
-                        if 'indicators' in result and 'quote' in result['indicators']:
-                            quotes = result['indicators']['quote'][0]
-                            if 'close' in quotes:
-                                prices = [p for p in quotes['close'] if p is not None]
-                    
-                    if len(prices) >= 200:
-                        signals = self.check_signals(symbol, prices)
+                    prices = self.extract_close_prices(hist_data)
+                    htf_prices = self.extract_close_prices(htf_data)
+
+                    if len(prices) >= 200 and len(htf_prices) >= self.trend_ma_period:
+                        signals = self.check_signals(symbol, prices, htf_prices)
                         
                         if signals:
                             for signal in signals:
-                                signal['timeframe'] = '15m'
+                                signal['timeframe'] = self.timeframe
                                 signal['session'] = current_session
                                 
                                 self.save_alert_to_firebase({
@@ -342,11 +386,12 @@ class FibSMATradingBot:
                                 print(f"\n🎯 SIGNAL FOUND: {symbol}")
                                 print(f"   Type: {signal['type']} - {signal['signal']}")
                                 print(f"   Price: ${signal['price']:.4f}")
+                                print(f"   Z-Score: {signal['zscore']:.3f}")
                                 print(f"   Confidence: {signal['confidence']}")
                         else:
                             print(f"ℹ️ No signals for {symbol}")
                     else:
-                        print(f"⚠️ Insufficient data for {symbol} ({len(prices)} candles)")
+                        print(f"⚠️ Insufficient data for {symbol} ({len(prices)} {self.timeframe} candles, {len(htf_prices)} {self.htf_timeframe} candles)")
                         
                 except Exception as e:
                     print(f"❌ Error processing {symbol}: {e}")

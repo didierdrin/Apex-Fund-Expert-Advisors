@@ -32,13 +32,25 @@ class FibSMATradingBot:
         
         # Trading symbols
         self.watchlist = [
-            'GBPJPY=X',  # GBP/JPY Forex
-            'XAUUSD=X',  # Gold vs USD
-            'USDCAD=X',  # USD/CAD Forex
-            'BTC-USD',   # Bitcoin vs USD
             'EURUSD=X',  # EUR/USD
+            'GBPJPY=X',  # GBP/JPY
+            'AUDJPY=X',  # AUD/JPY
+            'XAUUSD=X',  # Gold vs USD
+            'USDCAD=X',  # USD/CAD
             'GBPUSD=X',  # GBP/USD
-            'USDJPY=X'   # USD/JPY
+            'EURJPY=X',  # EUR/JPY
+            'USDJPY=X',  # USD/JPY
+            'AUDUSD=X',  # AUD/USD
+            'NZDUSD=X',  # NZD/USD
+            'USDCHF=X',  # USD/CHF
+            'EURGBP=X',  # EUR/GBP
+            'EURCAD=X',  # EUR/CAD
+            'GBPCAD=X',  # GBP/CAD
+            'AUDCAD=X',  # AUD/CAD
+            'EURAUD=X',  # EUR/AUD
+            'XAUEUR=X',  # Gold vs EUR
+            'BTC-USD',   # Bitcoin vs USD
+            'ETH-USD'    # Ethereum vs USD
         ]
         
         self.request_count = 0
@@ -70,13 +82,25 @@ class FibSMATradingBot:
 
         # Approximate min tick by symbol for SMA-distance filter
         self.symbol_min_tick = {
+            'EURUSD=X': 0.0001,
             'GBPJPY=X': 0.01,
+            'AUDJPY=X': 0.01,
             'XAUUSD=X': 0.01,
             'USDCAD=X': 0.0001,
-            'BTC-USD': 0.01,
-            'EURUSD=X': 0.0001,
             'GBPUSD=X': 0.0001,
-            'USDJPY=X': 0.01
+            'EURJPY=X': 0.01,
+            'USDJPY=X': 0.01,
+            'AUDUSD=X': 0.0001,
+            'NZDUSD=X': 0.0001,
+            'USDCHF=X': 0.0001,
+            'EURGBP=X': 0.0001,
+            'EURCAD=X': 0.0001,
+            'GBPCAD=X': 0.0001,
+            'AUDCAD=X': 0.0001,
+            'EURAUD=X': 0.0001,
+            'XAUEUR=X': 0.01,
+            'BTC-USD': 0.01,
+            'ETH-USD': 0.01
         }
         
         # Initialize Firebase (only once)

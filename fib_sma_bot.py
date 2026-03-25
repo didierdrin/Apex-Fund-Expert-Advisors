@@ -8,6 +8,7 @@ import tempfile
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
+from statsmodels.tsa.stattools import adfuller
 import firebase_admin
 from firebase_admin import credentials, firestore
 from flask import Flask, jsonify
@@ -73,7 +74,7 @@ class FibSMATradingBot:
 
         # Stationarity strategy parameters (translated from Pine Script)
         self.lookback = 50
-        self.stationarity_threshold = 0.05
+        self.stationarity_threshold = 0.05  # p-value threshold for stationarity
         self.zscore_threshold = 1.5
         self.trend_ma_period = 20
         self.sma_slope_period = 5
@@ -252,20 +253,40 @@ class FibSMATradingBot:
                         prices = [p for p in quotes['close'] if p is not None]
         return prices
 
+    def check_stationarity(self, prices):
+        """Check stationarity using Augmented Dickey-Fuller test"""
+        try:
+            # Use the most recent data for stationarity test
+            if len(prices) < self.lookback:
+                return 1.0  # Not stationary, high p-value
+            
+            # Use the last 'lookback' periods
+            recent_prices = prices[-self.lookback:]
+            
+            # Perform Augmented Dickey-Fuller test
+            result = adfuller(recent_prices, autolag='AIC')
+            p_value = result[1]  # p-value
+            
+            return p_value
+        except Exception as e:
+            print(f"⚠️ Error in stationarity test: {e}")
+            return 1.0  # Return high p-value on error
+    
     def check_signals(self, symbol, prices, htf_prices):
         """Check stationarity strategy signals on H1 timeframe."""
         min_required = max(200, self.lookback, 50 + self.sma_slope_period)
         if len(prices) < min_required or len(htf_prices) < self.trend_ma_period:
+            print(f"⚠️ Insufficient data: prices={len(prices)}, htf={len(htf_prices)}")
             return []
 
         closes = pd.Series(prices, dtype='float64')
         htf_closes = pd.Series(htf_prices, dtype='float64')
 
-        # Stationarity placeholder from Pine script
-        p_value = 0.01
+        # Calculate stationarity
+        p_value = self.check_stationarity(prices)
         is_stationary = p_value < self.stationarity_threshold
-        if not is_stationary:
-            return []
+        
+        print(f"📊 Stationarity check: p_value={p_value:.4f}, is_stationary={is_stationary}")
 
         sma_lookback_series = closes.rolling(window=self.lookback).mean()
         stddev_lookback_series = closes.rolling(window=self.lookback).std(ddof=0)
@@ -277,14 +298,17 @@ class FibSMATradingBot:
         stddev_lookback = stddev_lookback_series.iloc[-1]
         sma50 = sma50_series.iloc[-1]
         sma200 = sma200_series.iloc[-1]
-        prev_sma50 = sma50_series.iloc[-1 - self.sma_slope_period]
+        prev_sma50 = sma50_series.iloc[-1 - self.sma_slope_period] if len(sma50_series) > self.sma_slope_period else sma50
         htf_close = htf_closes.iloc[-1]
         htf_sma = htf_sma_series.iloc[-1]
         current_price = closes.iloc[-1]
 
-        if any(pd.isna(v) for v in [sma_lookback, stddev_lookback, sma50, sma200, prev_sma50, htf_sma]):
+        if any(pd.isna(v) for v in [sma_lookback, stddev_lookback, sma50, sma200, htf_sma]):
+            print(f"⚠️ NaN values detected, skipping signal check")
             return []
-        if stddev_lookback == 0 or prev_sma50 == 0:
+        
+        if stddev_lookback == 0:
+            print(f"⚠️ Standard deviation is zero, skipping")
             return []
 
         zscore = (current_price - sma_lookback) / stddev_lookback
@@ -294,7 +318,7 @@ class FibSMATradingBot:
         bullish_trend = sma50 > sma200
         bearish_trend = sma50 < sma200
 
-        sma50_pct_change = ((sma50 - prev_sma50) / prev_sma50) * 100
+        sma50_pct_change = ((sma50 - prev_sma50) / prev_sma50) * 100 if prev_sma50 != 0 else 0
         sma_slope_ok = abs(sma50_pct_change) <= self.max_sma_slope_percent
 
         min_tick = self.symbol_min_tick.get(symbol, 0.0001)
@@ -303,6 +327,9 @@ class FibSMATradingBot:
 
         bullish_valid = bullish_trend and sma_distance_ok and sma_slope_ok
         bearish_valid = bearish_trend and sma_distance_ok and sma_slope_ok
+
+        print(f"📊 Indicators - Z-Score: {zscore:.3f}, SMA50 Slope: {sma50_pct_change:.2f}%, Distance: {sma_distance_ticks:.0f} ticks")
+        print(f"📊 Trends - HTF Bullish: {htf_trend_bullish}, Bullish Trend: {bullish_trend}, Bearish Valid: {bearish_valid}")
 
         base_entry_long = is_stationary and zscore < -self.zscore_threshold and htf_trend_bullish
         base_entry_short = is_stationary and zscore > self.zscore_threshold and htf_trend_bearish
@@ -322,6 +349,7 @@ class FibSMATradingBot:
                 'price': float(current_price),
                 'confidence': 'HIGH'
             })
+            print(f"🎯 LONG ENTRY SIGNAL DETECTED!")
         if entry_short:
             signals.append({
                 'type': 'SELL',
@@ -329,6 +357,7 @@ class FibSMATradingBot:
                 'price': float(current_price),
                 'confidence': 'HIGH'
             })
+            print(f"🎯 SHORT ENTRY SIGNAL DETECTED!")
         if exit_long:
             signals.append({
                 'type': 'EXIT_LONG',
@@ -336,6 +365,7 @@ class FibSMATradingBot:
                 'price': float(current_price),
                 'confidence': 'MEDIUM'
             })
+            print(f"🎯 LONG EXIT SIGNAL DETECTED!")
         if exit_short:
             signals.append({
                 'type': 'EXIT_SHORT',
@@ -343,6 +373,7 @@ class FibSMATradingBot:
                 'price': float(current_price),
                 'confidence': 'MEDIUM'
             })
+            print(f"🎯 SHORT EXIT SIGNAL DETECTED!")
 
         indicator_context = {
             'zscore': float(zscore),
@@ -400,18 +431,23 @@ class FibSMATradingBot:
                                 signal['timeframe'] = self.timeframe
                                 signal['session'] = current_session
                                 
-                                self.save_alert_to_firebase({
+                                # Add to Firebase
+                                success = self.save_alert_to_firebase({
                                     'symbol': symbol,
                                     **signal
                                 })
-                                signals_found += 1
-                                total_signals += 1
                                 
-                                print(f"\n🎯 SIGNAL FOUND: {symbol}")
-                                print(f"   Type: {signal['type']} - {signal['signal']}")
-                                print(f"   Price: ${signal['price']:.4f}")
-                                print(f"   Z-Score: {signal['zscore']:.3f}")
-                                print(f"   Confidence: {signal['confidence']}")
+                                if success:
+                                    signals_found += 1
+                                    total_signals += 1
+                                    
+                                    print(f"\n🎯 SIGNAL FOUND: {symbol}")
+                                    print(f"   Type: {signal['type']} - {signal['signal']}")
+                                    print(f"   Price: ${signal['price']:.4f}")
+                                    print(f"   Z-Score: {signal['zscore']:.3f}")
+                                    print(f"   Confidence: {signal['confidence']}")
+                                else:
+                                    print(f"❌ Failed to save signal to Firebase")
                         else:
                             print(f"ℹ️ No signals for {symbol}")
                     else:

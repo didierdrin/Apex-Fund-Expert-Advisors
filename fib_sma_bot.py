@@ -25,7 +25,29 @@ total_signals = 0
 _startup_test_written = False
 
 
-def write_startup_test_to_firebase(db):
+def fetch_h1_prices_snapshot(bot):
+    """
+    Fetch the latest H1 close for each symbol in the bot watchlist.
+    Returns (prices_dict, errors_dict).
+    """
+    prices = {}
+    errors = {}
+
+    for symbol in getattr(bot, "watchlist", []):
+        try:
+            hist_data = bot.get_historical_data(symbol, interval="1h", range="2d")
+            closes = bot.extract_close_prices(hist_data)
+            if closes:
+                prices[symbol] = float(closes[-1])
+            else:
+                errors[symbol] = "no_close_prices"
+        except Exception as e:
+            errors[symbol] = str(e)
+
+    return prices, errors
+
+
+def write_startup_test_to_firebase(db, *, bot=None):
     """
     Write a single startup marker document to Firestore.
 
@@ -52,6 +74,15 @@ def write_startup_test_to_firebase(db):
             "pid": os.getpid(),
             "python_version": sys.version,
         }
+
+        if bot is not None:
+            prices, price_errors = fetch_h1_prices_snapshot(bot)
+            payload["timeframe"] = "1h"
+            payload["h1_prices"] = prices
+            payload["h1_price_errors"] = price_errors
+            payload["h1_prices_count"] = len(prices)
+            payload["h1_price_errors_count"] = len(price_errors)
+            payload["rapidapi_requests_used"] = getattr(bot, "request_count", None)
 
         db.collection("backend_startup_test").document(doc_id).set(payload)
         _startup_test_written = True
@@ -566,7 +597,7 @@ if __name__ == "__main__":
     bot_instance = FibSMATradingBot(API_KEY)
 
     # One-time startup test write (verify Firebase console receives data)
-    write_startup_test_to_firebase(bot_instance.db)
+    write_startup_test_to_firebase(bot_instance.db, bot=bot_instance)
     
     # Start bot in background thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)

@@ -143,6 +143,10 @@ class FibSMATradingBot:
         self.data_range = '1mo'
         self.htf_data_range = '3mo'
 
+        # Simple in-memory cache for price series (process lifetime)
+        # Structure: { (symbol, interval): { "closes": [...], "fetched_at": iso } }
+        self._series_cache = {}
+
         # Stationarity strategy parameters (translated from Pine Script)
         self.lookback = 50
         self.stationarity_threshold = 0.05  # p-value threshold for stationarity
@@ -324,6 +328,44 @@ class FibSMATradingBot:
                         prices = [p for p in quotes['close'] if p is not None]
         return prices
 
+    def get_close_series(self, symbol, *, interval, preferred_range, min_len, ranges_to_try=None, max_age_seconds=60 * 20):
+        """
+        Return a list of close prices for a symbol/interval.
+
+        - Reuses a recent cached series when available.
+        - If the series is too short, retries with larger ranges to obtain enough candles.
+        """
+        cache_key = (symbol, interval)
+        cached = self._series_cache.get(cache_key)
+        if cached:
+            try:
+                fetched_at = datetime.fromisoformat(cached["fetched_at"])
+                age_seconds = (datetime.utcnow() - fetched_at).total_seconds()
+                if age_seconds <= max_age_seconds and isinstance(cached.get("closes"), list) and len(cached["closes"]) >= min_len:
+                    return cached["closes"]
+            except Exception:
+                pass
+
+        if ranges_to_try is None:
+            ranges_to_try = [preferred_range, '3mo', '6mo', '1y', '2y', '5y']
+
+        best = []
+        for r in ranges_to_try:
+            hist_data = self.get_historical_data(symbol, interval=interval, range=r)
+            closes = self.extract_close_prices(hist_data)
+            if len(closes) > len(best):
+                best = closes
+            if len(closes) >= min_len:
+                best = closes
+                break
+
+        self._series_cache[cache_key] = {
+            "closes": best,
+            "fetched_at": datetime.utcnow().isoformat(),
+            "range_used": r if 'r' in locals() else preferred_range,
+        }
+        return best
+
     def check_stationarity(self, prices):
         """Check stationarity using Augmented Dickey-Fuller test"""
         try:
@@ -486,46 +528,52 @@ class FibSMATradingBot:
                 break
             
             print(f"\n🔍 Checking {symbol}...")
-            hist_data = self.get_historical_data(symbol, interval=self.timeframe, range=self.data_range)
-            htf_data = self.get_historical_data(symbol, interval=self.htf_timeframe, range=self.htf_data_range)
+            try:
+                min_required = max(200, self.lookback, 50 + self.sma_slope_period)
+                prices = self.get_close_series(
+                    symbol,
+                    interval=self.timeframe,
+                    preferred_range=self.data_range,
+                    min_len=min_required,
+                )
+                htf_prices = self.get_close_series(
+                    symbol,
+                    interval=self.htf_timeframe,
+                    preferred_range=self.htf_data_range,
+                    min_len=self.trend_ma_period,
+                )
 
-            if hist_data and htf_data:
-                try:
-                    prices = self.extract_close_prices(hist_data)
-                    htf_prices = self.extract_close_prices(htf_data)
-
-                    if len(prices) >= 200 and len(htf_prices) >= self.trend_ma_period:
-                        signals = self.check_signals(symbol, prices, htf_prices)
+                if len(prices) >= min_required and len(htf_prices) >= self.trend_ma_period:
+                    signals = self.check_signals(symbol, prices, htf_prices)
                         
-                        if signals:
-                            for signal in signals:
-                                signal['timeframe'] = self.timeframe
-                                signal['session'] = current_session
-                                
-                                # Add to Firebase
-                                success = self.save_alert_to_firebase({
-                                    'symbol': symbol,
-                                    **signal
-                                })
-                                
-                                if success:
-                                    signals_found += 1
-                                    total_signals += 1
-                                    
-                                    print(f"\n🎯 SIGNAL FOUND: {symbol}")
-                                    print(f"   Type: {signal['type']} - {signal['signal']}")
-                                    print(f"   Price: ${signal['price']:.4f}")
-                                    print(f"   Z-Score: {signal['zscore']:.3f}")
-                                    print(f"   Confidence: {signal['confidence']}")
-                                else:
-                                    print(f"❌ Failed to save signal to Firebase")
-                        else:
-                            print(f"ℹ️ No signals for {symbol}")
+                    if signals:
+                        for signal in signals:
+                            signal['timeframe'] = self.timeframe
+                            signal['session'] = current_session
+
+                            # Add to Firebase
+                            success = self.save_alert_to_firebase({
+                                'symbol': symbol,
+                                **signal
+                            })
+
+                            if success:
+                                signals_found += 1
+                                total_signals += 1
+
+                                print(f"\n🎯 SIGNAL FOUND: {symbol}")
+                                print(f"   Type: {signal['type']} - {signal['signal']}")
+                                print(f"   Price: ${signal['price']:.4f}")
+                                print(f"   Z-Score: {signal['zscore']:.3f}")
+                                print(f"   Confidence: {signal['confidence']}")
+                            else:
+                                print(f"❌ Failed to save signal to Firebase")
                     else:
-                        print(f"⚠️ Insufficient data for {symbol} ({len(prices)} {self.timeframe} candles, {len(htf_prices)} {self.htf_timeframe} candles)")
-                        
-                except Exception as e:
-                    print(f"❌ Error processing {symbol}: {e}")
+                        print(f"ℹ️ No signals for {symbol}")
+                else:
+                    print(f"⚠️ Insufficient data for {symbol} ({len(prices)} {self.timeframe} candles, {len(htf_prices)} {self.htf_timeframe} candles)")
+            except Exception as e:
+                print(f"❌ Error processing {symbol}: {e}")
             
             time.sleep(1.5)
         

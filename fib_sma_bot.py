@@ -136,7 +136,7 @@ class FibSMATradingBot:
         }
         
         # Trading parameters
-        self.check_interval = 30  # minutes
+        self.check_interval = 10  # minutes
         self.session_active_hours = 3
         self.timeframe = '1h'
         self.htf_timeframe = '4h'
@@ -511,14 +511,14 @@ class FibSMATradingBot:
         print(f"🚀 Scan started at {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
         print(f"{'='*60}")
         
-        is_trading_time, current_session = self.is_trading_time()
+        # Always scan (24/7). We still compute the session label for logging/metadata.
+        current_session = self.get_current_session()
         last_check_time = datetime.now().isoformat()
-        
-        if not is_trading_time:
-            print(f"⏰ Not in trading window. Next check at {(datetime.utcnow() + timedelta(minutes=30)).strftime('%H:%M')} UTC")
-            return
-        
-        print(f"📈 Trading window active - {self.sessions[current_session]['name']}")
+
+        if current_session in self.sessions:
+            print(f"📈 Scanning now - {self.sessions[current_session]['name']}")
+        else:
+            print("📈 Scanning now - Off hours")
         
         signals_found = 0
         
@@ -627,8 +627,8 @@ def run_bot():
         except Exception as e:
             print(f"❌ Error in bot scan: {e}")
         
-        # Sleep for 30 minutes
-        time.sleep(1800)
+        # Sleep for 10 minutes
+        time.sleep(600)
 
 if __name__ == "__main__":
     print("🚀 Initializing Fib SMA Trading Bot...")

@@ -13,6 +13,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from flask import Flask, jsonify
 import threading
+import socket
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -21,6 +22,45 @@ app = Flask(__name__)
 bot_instance = None
 last_check_time = None
 total_signals = 0
+_startup_test_written = False
+
+
+def write_startup_test_to_firebase(db):
+    """
+    Write a single startup marker document to Firestore.
+
+    This runs once per backend start (process lifetime) and is useful to verify
+    Firestore writes are working by checking the Firebase console.
+    """
+    global _startup_test_written
+
+    if _startup_test_written:
+        return False
+
+    if not db:
+        print("⚠️ Firebase not initialized, skipping startup test write")
+        _startup_test_written = True
+        return False
+
+    try:
+        now_utc = datetime.utcnow()
+        doc_id = f"{now_utc.strftime('%Y%m%dT%H%M%S')}_{os.getpid()}"
+        payload = {
+            "type": "backend_startup_test",
+            "timestamp_utc": now_utc.isoformat() + "Z",
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "python_version": sys.version,
+        }
+
+        db.collection("backend_startup_test").document(doc_id).set(payload)
+        _startup_test_written = True
+        print("✅ Startup test written to Firebase collection: backend_startup_test")
+        return True
+    except Exception as e:
+        _startup_test_written = True
+        print(f"❌ Error writing startup test to Firebase: {e}")
+        return False
 
 class FibSMATradingBot:
     def __init__(self, api_key):
@@ -524,6 +564,9 @@ if __name__ == "__main__":
     
     # Create bot instance
     bot_instance = FibSMATradingBot(API_KEY)
+
+    # One-time startup test write (verify Firebase console receives data)
+    write_startup_test_to_firebase(bot_instance.db)
     
     # Start bot in background thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)

@@ -157,10 +157,17 @@ class FibSMATradingBot:
         self.max_sma_slope_percent = 0.25
         self.min_sma_distance_ticks = 500
 
-        # Replay recent H1 history to list bars where the same rules fired (logging only; can be heavy)
-        self.historical_signal_lookback_bars = int(os.environ.get("HISTORICAL_SIGNAL_LOOKBACK", "400"))
+        # Replay recent H1 history to list bars where the same rules fired (logging only; can be heavy).
+        # Default: last 4 weeks on H1 = 7 * 24 * 4 = 672 bars. Override with HISTORICAL_SIGNAL_LOOKBACK (bars)
+        # or HISTORICAL_SIGNAL_WEEKS (e.g. 6 for six weeks).
+        if os.environ.get("HISTORICAL_SIGNAL_LOOKBACK") is not None:
+            self.historical_signal_lookback_bars = int(os.environ["HISTORICAL_SIGNAL_LOOKBACK"])
+        else:
+            weeks = int(os.environ.get("HISTORICAL_SIGNAL_WEEKS", "4"))
+            self.historical_signal_lookback_bars = max(1, weeks) * 7 * 24
         self.historical_signal_step_bars = int(os.environ.get("HISTORICAL_SIGNAL_STEP", "4"))
         self.historical_signal_max_matches = int(os.environ.get("HISTORICAL_SIGNAL_MAX_MATCHES", "10"))
+        self._historical_replay_weeks_approx = self.historical_signal_lookback_bars / float(7 * 24)
 
         # Approximate min tick by symbol for SMA-distance filter
         self.symbol_min_tick = {
@@ -717,8 +724,8 @@ class FibSMATradingBot:
                     past = self.find_historical_matching_signals(symbol, prices, htf_prices)
                     if past:
                         print(
-                            f"   📜 Historical matches (same rules; last ~{self.historical_signal_lookback_bars} H1 bars, "
-                            f"step {self.historical_signal_step_bars}):"
+                            f"   📜 Historical matches (same rules; last {self.historical_signal_lookback_bars} H1 bars "
+                            f"≈ {self._historical_replay_weeks_approx:.1f} weeks, step {self.historical_signal_step_bars}):"
                         )
                         for m in past:
                             z = m.get("zscore")
@@ -733,7 +740,8 @@ class FibSMATradingBot:
                     else:
                         print(
                             f"   📜 No historical matches in replay window "
-                            f"(lookback {self.historical_signal_lookback_bars} H1, step {self.historical_signal_step_bars})."
+                            f"({self.historical_signal_lookback_bars} H1 ≈ {self._historical_replay_weeks_approx:.1f} weeks, "
+                            f"step {self.historical_signal_step_bars})."
                         )
                 else:
                     print(f"⚠️ Insufficient data for {symbol} ({len(prices)} {self.timeframe} candles, {len(htf_prices)} {self.htf_timeframe} candles)")

@@ -157,6 +157,11 @@ class FibSMATradingBot:
         self.max_sma_slope_percent = 0.25
         self.min_sma_distance_ticks = 500
 
+        # Replay recent H1 history to list bars where the same rules fired (logging only; can be heavy)
+        self.historical_signal_lookback_bars = int(os.environ.get("HISTORICAL_SIGNAL_LOOKBACK", "400"))
+        self.historical_signal_step_bars = int(os.environ.get("HISTORICAL_SIGNAL_STEP", "4"))
+        self.historical_signal_max_matches = int(os.environ.get("HISTORICAL_SIGNAL_MAX_MATCHES", "10"))
+
         # Approximate min tick by symbol for SMA-distance filter
         self.symbol_min_tick = {
             'EURUSD=X': 0.0001,
@@ -367,7 +372,7 @@ class FibSMATradingBot:
         }
         return best
 
-    def check_stationarity(self, prices):
+    def check_stationarity(self, prices, verbose=True):
         """
         Check stationarity using multiple methods to match TradingView's behavior.
         Since TradingView doesn't have a built-in ADF test, we implement several
@@ -421,30 +426,84 @@ class FibSMATradingBot:
             final_p_value = max(adf_p_value, 1.0 - cross_rate)
             
             # Log detailed stationarity check
-            print(f"   Stationarity Details - ADF p-value: {adf_p_value:.4f}, Trend Strength: {trend_strength:.3f}, "
-                  f"Mean Variation: {mean_variation:.3f}, Cross Rate: {cross_rate:.3f}")
-            print(f"   Stationary: {is_stationary} (Strong trend: {has_strong_trend}, Mean stable: {mean_stable}, Mean reverting: {is_mean_reverting})")
+            if verbose:
+                print(f"   Stationarity Details - ADF p-value: {adf_p_value:.4f}, Trend Strength: {trend_strength:.3f}, "
+                      f"Mean Variation: {mean_variation:.3f}, Cross Rate: {cross_rate:.3f}")
+                print(f"   Stationary: {is_stationary} (Strong trend: {has_strong_trend}, Mean stable: {mean_stable}, Mean reverting: {is_mean_reverting})")
             
             return final_p_value, is_stationary
             
         except Exception as e:
             print(f"⚠️ Error in stationarity test: {e}")
             return 1.0, False  # Return high p-value and not stationary on error
-    
-    def check_signals(self, symbol, prices, htf_prices):
+
+    def _htf_prefix_for_h1_end(self, htf_prices, h1_total_len, end_index):
+        """Approximate how much 4H history aligns when H1 series ends at end_index (inclusive)."""
+        if not htf_prices or h1_total_len <= 0:
+            return []
+        ratio = (end_index + 1) / float(h1_total_len)
+        htf_len = int(round(ratio * len(htf_prices)))
+        htf_len = max(self.trend_ma_period, htf_len)
+        htf_len = min(htf_len, len(htf_prices))
+        return htf_prices[:htf_len]
+
+    def find_historical_matching_signals(self, symbol, prices, htf_prices):
+        """
+        Walk recent H1 bars and report where the same strategy would have fired.
+        Uses proportional trimming of the 4H series so past bars see coherent HTF context.
+        """
+        min_required = max(200, self.lookback, 50 + self.sma_slope_period)
+        h1_total = len(prices)
+        if h1_total < min_required or len(htf_prices) < self.trend_ma_period:
+            return []
+
+        start = max(min_required - 1, h1_total - self.historical_signal_lookback_bars)
+        step = max(1, self.historical_signal_step_bars)
+        matches = []
+
+        # Newest → oldest so logs show the most recent bars that matched first
+        for end in range(h1_total - 1, start - 1, -step):
+            sub_h1 = prices[: end + 1]
+            sub_htf = self._htf_prefix_for_h1_end(htf_prices, h1_total, end)
+            if len(sub_htf) < self.trend_ma_period:
+                continue
+
+            sigs = self.check_signals(symbol, sub_h1, sub_htf, verbose=False)
+            if not sigs:
+                continue
+
+            bars_ago = h1_total - 1 - end
+            for s in sigs:
+                if len(matches) >= self.historical_signal_max_matches:
+                    return matches
+                matches.append({
+                    "bars_ago": bars_ago,
+                    "h1_end_index": end,
+                    "type": s.get("type"),
+                    "signal": s.get("signal"),
+                    "price": s.get("price"),
+                    "zscore": s.get("zscore"),
+                    "is_stationary": s.get("is_stationary"),
+                })
+
+        return matches
+
+    def check_signals(self, symbol, prices, htf_prices, verbose=True):
         """Check stationarity strategy signals on H1 timeframe."""
         min_required = max(200, self.lookback, 50 + self.sma_slope_period)
         if len(prices) < min_required or len(htf_prices) < self.trend_ma_period:
-            print(f"⚠️ Insufficient data: prices={len(prices)}, htf={len(htf_prices)}")
+            if verbose:
+                print(f"⚠️ Insufficient data: prices={len(prices)}, htf={len(htf_prices)}")
             return []
 
         closes = pd.Series(prices, dtype='float64')
         htf_closes = pd.Series(htf_prices, dtype='float64')
 
         # Calculate stationarity (returns tuple of p_value and is_stationary)
-        p_value, is_stationary = self.check_stationarity(prices)
+        p_value, is_stationary = self.check_stationarity(prices, verbose=verbose)
         
-        print(f"📊 Stationarity check: p_value={p_value:.4f}, is_stationary={is_stationary}")
+        if verbose:
+            print(f"📊 Stationarity check: p_value={p_value:.4f}, is_stationary={is_stationary}")
 
         # Calculate all indicators
         sma_lookback_series = closes.rolling(window=self.lookback).mean()
@@ -471,11 +530,13 @@ class FibSMATradingBot:
 
         # Check for NaN values
         if any(pd.isna(v) for v in [sma_lookback, stddev_lookback, sma50, sma200, htf_sma]):
-            print(f"⚠️ NaN values detected, skipping signal check")
+            if verbose:
+                print(f"⚠️ NaN values detected, skipping signal check")
             return []
         
         if stddev_lookback == 0:
-            print(f"⚠️ Standard deviation is zero, skipping")
+            if verbose:
+                print(f"⚠️ Standard deviation is zero, skipping")
             return []
 
         # Calculate Z-score
@@ -506,9 +567,10 @@ class FibSMATradingBot:
         bullish_valid = bullish_trend and sma_distance_ok and sma_slope_ok
         bearish_valid = bearish_trend and sma_distance_ok and sma_slope_ok
 
-        print(f"📊 Indicators - Z-Score: {zscore:.3f}, SMA50 Slope: {sma50_pct_change:.2f}%, Distance: {sma_distance_ticks:.0f} ticks")
-        print(f"📊 Trends - HTF Bullish: {htf_trend_bullish}, Bullish Trend: {bullish_trend}, Bearish Valid: {bearish_valid}")
-        print(f"📊 Filters - SMA Slope OK: {sma_slope_ok}, SMA Distance OK: {sma_distance_ok}")
+        if verbose:
+            print(f"📊 Indicators - Z-Score: {zscore:.3f}, SMA50 Slope: {sma50_pct_change:.2f}%, Distance: {sma_distance_ticks:.0f} ticks")
+            print(f"📊 Trends - HTF Bullish: {htf_trend_bullish}, Bullish Trend: {bullish_trend}, Bearish Valid: {bearish_valid}")
+            print(f"📊 Filters - SMA Slope OK: {sma_slope_ok}, SMA Distance OK: {sma_distance_ok}")
 
         # Base conditions (matching Pine Script exactly)
         base_entry_long = is_stationary and zscore < -self.zscore_threshold and htf_trend_bullish
@@ -531,7 +593,8 @@ class FibSMATradingBot:
                 'price': float(current_price),
                 'confidence': 'HIGH'
             })
-            print(f"🎯 LONG ENTRY SIGNAL DETECTED!")
+            if verbose:
+                print(f"🎯 LONG ENTRY SIGNAL DETECTED!")
             
         if entry_short:
             signals.append({
@@ -540,7 +603,8 @@ class FibSMATradingBot:
                 'price': float(current_price),
                 'confidence': 'HIGH'
             })
-            print(f"🎯 SHORT ENTRY SIGNAL DETECTED!")
+            if verbose:
+                print(f"🎯 SHORT ENTRY SIGNAL DETECTED!")
             
         if exit_long:
             signals.append({
@@ -549,7 +613,8 @@ class FibSMATradingBot:
                 'price': float(current_price),
                 'confidence': 'MEDIUM'
             })
-            print(f"🎯 LONG EXIT SIGNAL DETECTED!")
+            if verbose:
+                print(f"🎯 LONG EXIT SIGNAL DETECTED!")
             
         if exit_short:
             signals.append({
@@ -558,7 +623,8 @@ class FibSMATradingBot:
                 'price': float(current_price),
                 'confidence': 'MEDIUM'
             })
-            print(f"🎯 SHORT EXIT SIGNAL DETECTED!")
+            if verbose:
+                print(f"🎯 SHORT EXIT SIGNAL DETECTED!")
 
         # Add indicator context to signals
         indicator_context = {
@@ -621,7 +687,7 @@ class FibSMATradingBot:
                 )
 
                 if len(prices) >= min_required and len(htf_prices) >= self.trend_ma_period:
-                    signals = self.check_signals(symbol, prices, htf_prices)
+                    signals = self.check_signals(symbol, prices, htf_prices, verbose=True)
                         
                     if signals:
                         for signal in signals:
@@ -647,6 +713,28 @@ class FibSMATradingBot:
                                 print(f"❌ Failed to save signal to Firebase")
                     else:
                         print(f"ℹ️ No signals for {symbol}")
+
+                    past = self.find_historical_matching_signals(symbol, prices, htf_prices)
+                    if past:
+                        print(
+                            f"   📜 Historical matches (same rules; last ~{self.historical_signal_lookback_bars} H1 bars, "
+                            f"step {self.historical_signal_step_bars}):"
+                        )
+                        for m in past:
+                            z = m.get("zscore")
+                            z_str = f"{z:.3f}" if z is not None else "n/a"
+                            pr = m.get("price")
+                            p_str = f"{pr:.4f}" if pr is not None else "n/a"
+                            st = m.get("is_stationary")
+                            print(
+                                f"      ~{m['bars_ago']} bars ago | {m.get('type')} | {m.get('signal')} | "
+                                f"z={z_str} | price={p_str} | stationary={st}"
+                            )
+                    else:
+                        print(
+                            f"   📜 No historical matches in replay window "
+                            f"(lookback {self.historical_signal_lookback_bars} H1, step {self.historical_signal_step_bars})."
+                        )
                 else:
                     print(f"⚠️ Insufficient data for {symbol} ({len(prices)} {self.timeframe} candles, {len(htf_prices)} {self.htf_timeframe} candles)")
             except Exception as e:
@@ -735,7 +823,7 @@ if __name__ == "__main__":
     
     # Run Flask app
     app.run(host='0.0.0.0', port=port)
-    
+
 
 
 # import requests

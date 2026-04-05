@@ -654,21 +654,22 @@ class FibSMATradingBot:
         return signals
     
     def scan_watchlist(self):
-        """Main scanning function"""
+        """Run one full watchlist pass (24/7 — not limited to FX session windows)."""
         global last_check_time, total_signals
         
         print(f"\n{'='*60}")
         print(f"🚀 Scan started at {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
         print(f"{'='*60}")
         
-        # Always scan (24/7). We still compute the session label for logging/metadata.
+        # 24/7 scan — no session window gate. Session name is only stored on alerts for context.
         current_session = self.get_current_session()
         last_check_time = datetime.now().isoformat()
 
         if current_session in self.sessions:
-            print(f"📈 Scanning now - {self.sessions[current_session]['name']}")
+            sess_label = self.sessions[current_session]['name']
         else:
-            print("📈 Scanning now - Off hours")
+            sess_label = 'off_hours (UTC)'
+        print(f"📈 24/7 scan — all hours (metadata session tag: {sess_label})")
         
         signals_found = 0
         
@@ -780,6 +781,8 @@ def status():
     
     return jsonify({
         'status': 'running',
+        'scan_mode': '24_7',
+        'scan_note': 'Watchlist is scanned around the clock; session fields are labels only.',
         'current_time_utc': datetime.utcnow().isoformat(),
         'current_session': current_session,
         'is_trading_time': is_trading,

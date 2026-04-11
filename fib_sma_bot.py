@@ -119,8 +119,10 @@ class FibSMATradingBot:
             "EURAUD=X", "XAUEUR=X", "BTC-USD",  "ETH-USD",
         ]
 
-        self.request_count = 0
-        self.max_requests  = 450
+        self.request_count  = 0
+        self.max_requests   = 450
+        self._rate_limited  = False          # set True on first 429; cleared after backoff
+        self._rate_limit_until = 0.0         # epoch seconds — don't fetch before this
 
         # ── Strategy parameters (matching Pine Script inputs) ──────────
         self.lookback               = int(os.environ.get("LOOKBACK",             "50"))
@@ -219,17 +221,38 @@ class FibSMATradingBot:
 
     def get_historical_data(self, symbol, interval="1h", range="1mo"):
         if self.request_count >= self.max_requests:
-            print(f"⚠️  Request limit reached for {symbol}")
+            print(f"⚠️  Monthly request limit reached for {symbol}")
             return None
+
+        # Honour active rate-limit backoff
+        wait = self._rate_limit_until - time.time()
+        if wait > 0:
+            print(f"⏳ Rate-limit backoff — waiting {wait:.0f}s before retrying…")
+            time.sleep(wait)
+            self._rate_limited = False
+
         url = f"{self.base_url}/api/stock/get-chart"
         params = {"symbol": symbol, "interval": interval, "range": range, "region": "US"}
         try:
             print(f"📊 Fetching {interval} data for {symbol} (range={range})…")
             resp = requests.get(url, headers=self.headers, params=params)
             self.request_count += 1
+
             if resp.status_code == 200:
+                self._rate_limited = False
                 return resp.json()
+
+            if resp.status_code == 429:
+                # Respect Retry-After header if present, else back off 60 s
+                retry_after = int(resp.headers.get("Retry-After", 60))
+                self._rate_limit_until = time.time() + retry_after
+                self._rate_limited = True
+                print(f"🚫 429 Rate limit hit for {symbol} — backing off {retry_after}s "
+                      f"(until {datetime.utcfromtimestamp(self._rate_limit_until).strftime('%H:%M:%S')} UTC)")
+                return None  # caller must not retry immediately
+
             print(f"⚠️  API error {resp.status_code} for {symbol}")
+
         except Exception as e:
             print(f"❌ Fetch error for {symbol}: {e}")
         return None
@@ -261,6 +284,10 @@ class FibSMATradingBot:
             if len(closes) > len(best):
                 best = closes
             if len(closes) >= min_len:
+                break
+            # Stop retrying ranges if we just got rate-limited — no point hammering
+            if self._rate_limited:
+                print(f"   ⏸  Rate-limited — skipping remaining range retries for {symbol}/{interval}")
                 break
         self._series_cache[key] = {"closes": best, "fetched_at": datetime.utcnow().isoformat()}
         return best
@@ -515,7 +542,15 @@ class FibSMATradingBot:
             except Exception as e:
                 print(f"   ❌ Error: {e}")
 
-            time.sleep(1.5)
+            # Longer pause if we're rate-limited so the window resets before next symbol
+            if self._rate_limited:
+                wait = max(0, self._rate_limit_until - time.time())
+                if wait > 0:
+                    print(f"⏳ Waiting {wait:.0f}s for rate-limit window to reset…")
+                    time.sleep(wait)
+                    self._rate_limited = False
+            else:
+                time.sleep(1.5)
 
         print(f"\n{'='*60}")
         print(f"✅ Scan done — {signals_found} new signal(s)  |  "

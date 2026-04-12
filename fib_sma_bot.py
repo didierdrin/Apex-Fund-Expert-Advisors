@@ -43,6 +43,7 @@ def fetch_h1_prices_snapshot(bot):
 
 
 def write_startup_test_to_firebase(db, *, bot=None):
+    """Lightweight startup marker — zero API calls, just config info."""
     global _startup_test_written
     if _startup_test_written:
         return False
@@ -59,20 +60,16 @@ def write_startup_test_to_firebase(db, *, bot=None):
             "hostname": socket.gethostname(),
             "pid": os.getpid(),
             "python_version": sys.version,
+            # Config snapshot — no RapidAPI calls
+            "timeframe":        getattr(bot, "timeframe",        "1h")  if bot else None,
+            "htf_timeframe":    getattr(bot, "htf_timeframe",    "4h")  if bot else None,
+            "watchlist_count":  len(getattr(bot, "watchlist",    []))   if bot else None,
+            "zscore_threshold": getattr(bot, "zscore_threshold", None)  if bot else None,
+            "lookback":         getattr(bot, "lookback",         None)  if bot else None,
         }
-        if bot is not None:
-            prices, errs = fetch_h1_prices_snapshot(bot)
-            payload.update({
-                "timeframe": bot.timeframe,
-                "h1_prices": prices,
-                "h1_price_errors": errs,
-                "h1_prices_count": len(prices),
-                "h1_price_errors_count": len(errs),
-                "rapidapi_requests_used": getattr(bot, "request_count", None),
-            })
         db.collection("backend_startup_test").document(doc_id).set(payload)
         _startup_test_written = True
-        print("✅ Startup test written to Firebase")
+        print("✅ Startup test written to Firebase (zero API calls)")
         return True
     except Exception as e:
         _startup_test_written = True
@@ -237,6 +234,7 @@ class FibSMATradingBot:
             print(f"📊 Fetching {interval} data for {symbol} (range={range})…")
             resp = requests.get(url, headers=self.headers, params=params)
             self.request_count += 1
+            time.sleep(1.2)  # throttle: max ~50 req/min, well within typical RapidAPI limits
 
             if resp.status_code == 200:
                 self._rate_limited = False

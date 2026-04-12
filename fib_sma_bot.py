@@ -94,7 +94,7 @@ class FibSMATradingBot:
             "EURUSD=X", "GBPJPY=X", "AUDJPY=X", "XAUUSD=X", "USDCAD=X",
             "GBPUSD=X", "EURJPY=X", "USDJPY=X", "AUDUSD=X", "NZDUSD=X",
             "USDCHF=X", "EURGBP=X", "EURCAD=X", "GBPCAD=X", "AUDCAD=X",
-            "EURAUD=X", "XAUEUR=X", "BTC-USD",   "ETH-USD",
+            "EURAUD=X", "BTC-USD", "ETH-USD",
         ]
 
         # ── Strategy parameters (env-overridable, matching Pine inputs) ─
@@ -119,7 +119,7 @@ class FibSMATradingBot:
             "EURJPY=X": 0.01,   "USDJPY=X": 0.01,   "AUDUSD=X": 0.0001,
             "NZDUSD=X": 0.0001, "USDCHF=X": 0.0001, "EURGBP=X": 0.0001,
             "EURCAD=X": 0.0001, "GBPCAD=X": 0.0001, "AUDCAD=X": 0.0001,
-            "EURAUD=X": 0.0001, "XAUEUR=X": 0.01,   "BTC-USD":  0.01,
+            "EURAUD=X": 0.0001, "BTC-USD":  0.01,
             "ETH-USD":  0.01,
         }
 
@@ -201,7 +201,8 @@ class FibSMATradingBot:
         """Resample a 1H yfinance DataFrame to 4H close prices."""
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
-        resampled = df["Close"].resample("4h").last().dropna()
+        close = df["Close"].squeeze()
+        resampled = close.resample("4h").last().dropna()
         return resampled.tolist()
 
     def fetch_closes(self, symbol: str, interval: str, min_len: int) -> list:
@@ -262,7 +263,7 @@ class FibSMATradingBot:
                     )
                     if df.empty:
                         continue
-                    closes = df["Close"].dropna().tolist()
+                    closes = df["Close"].squeeze().dropna().tolist()
                     if len(closes) >= min_len:
                         break
                 except Exception as e:

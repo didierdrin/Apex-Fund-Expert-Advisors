@@ -1,4 +1,11 @@
-import requests
+"""
+Stationarity Trading Bot — yfinance edition
+============================================
+Data source : yfinance (free, no API key, no rate limits, no monthly cap)
+Strategy    : Pine Script v5 'Stationarity Trading Strategy'
+Signals     : entry_long / entry_short / exit_long / exit_short
+"""
+
 import time
 import os
 import sys
@@ -8,6 +15,7 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 from statsmodels.tsa.stattools import adfuller
+import yfinance as yf
 import firebase_admin
 from firebase_admin import credentials, firestore
 from flask import Flask, jsonify
@@ -17,33 +25,18 @@ from scipy import stats
 
 app = Flask(__name__)
 
-bot_instance = None
+bot_instance    = None
 last_check_time = None
-total_signals = 0
+total_signals   = 0
 _startup_test_written = False
 
 
 # ──────────────────────────────────────────────
-# Startup test
+# Startup test (zero external API calls)
 # ──────────────────────────────────────────────
 
-def fetch_h1_prices_snapshot(bot):
-    prices, errors = {}, {}
-    for symbol in getattr(bot, "watchlist", []):
-        try:
-            hist = bot.get_historical_data(symbol, interval="1h", range="2d")
-            closes = bot.extract_close_prices(hist)
-            if closes:
-                prices[symbol] = float(closes[-1])
-            else:
-                errors[symbol] = "no_close_prices"
-        except Exception as e:
-            errors[symbol] = str(e)
-    return prices, errors
-
-
 def write_startup_test_to_firebase(db, *, bot=None):
-    """Lightweight startup marker — zero API calls, just config info."""
+    """Write a lightweight config snapshot to Firestore at boot — no data API calls."""
     global _startup_test_written
     if _startup_test_written:
         return False
@@ -52,15 +45,15 @@ def write_startup_test_to_firebase(db, *, bot=None):
         _startup_test_written = True
         return False
     try:
-        now = datetime.utcnow()
+        now    = datetime.utcnow()
         doc_id = f"{now.strftime('%Y%m%dT%H%M%S')}_{os.getpid()}"
         payload = {
-            "type": "backend_startup_test",
-            "timestamp_utc": now.isoformat() + "Z",
-            "hostname": socket.gethostname(),
-            "pid": os.getpid(),
-            "python_version": sys.version,
-            # Config snapshot — no RapidAPI calls
+            "type":             "backend_startup_test",
+            "timestamp_utc":    now.isoformat() + "Z",
+            "hostname":         socket.gethostname(),
+            "pid":              os.getpid(),
+            "python_version":   sys.version,
+            "data_source":      "yfinance (free, no API key)",
             "timeframe":        getattr(bot, "timeframe",        "1h")  if bot else None,
             "htf_timeframe":    getattr(bot, "htf_timeframe",    "4h")  if bot else None,
             "watchlist_count":  len(getattr(bot, "watchlist",    []))   if bot else None,
@@ -85,58 +78,41 @@ class FibSMATradingBot:
     """
     Python implementation of Pine Script v5 'Stationarity Trading Strategy'.
 
+    Data layer  : yfinance — free, unlimited, no API key required.
     Signal logic (verbatim from Pine):
-        entry_long  = is_stationary AND zscore < -threshold AND htf_trend_bullish
-                      AND bullish_valid
-        entry_short = is_stationary AND zscore >  threshold AND htf_trend_bearish
-                      AND bearish_valid
+        entry_long  = is_stationary AND zscore < -threshold AND htf_trend_bullish AND bullish_valid
+        entry_short = is_stationary AND zscore >  threshold AND htf_trend_bearish AND bearish_valid
         exit_long   = zscore >  threshold AND bearish_valid
         exit_short  = zscore < -threshold AND bullish_valid
-
     where:
-        bullish_valid = sma50>sma200  AND dist>=500ticks  AND slope<=0.25%
-        bearish_valid = sma50<sma200  AND dist>=500ticks  AND slope<=0.25%
-
-    Pine htf = "15" (relative to chart TF). Since this bot uses 1H candles as
-    its base chart, the next meaningful HTF is 4H (env: HTF_TIMEFRAME, default 4h).
+        bullish_valid = sma50>sma200 AND dist>=500ticks AND slope<=0.25%
+        bearish_valid = sma50<sma200 AND dist>=500ticks AND slope<=0.25%
     """
 
-    def __init__(self, api_key):
-        self.api_key  = api_key
-        self.base_url = "https://yahoo-finance166.p.rapidapi.com"
-        self.headers  = {
-            "x-rapidapi-key":  api_key,
-            "x-rapidapi-host": "yahoo-finance166.p.rapidapi.com",
-        }
-
+    def __init__(self):
         self.watchlist = [
             "EURUSD=X", "GBPJPY=X", "AUDJPY=X", "XAUUSD=X", "USDCAD=X",
             "GBPUSD=X", "EURJPY=X", "USDJPY=X", "AUDUSD=X", "NZDUSD=X",
             "USDCHF=X", "EURGBP=X", "EURCAD=X", "GBPCAD=X", "AUDCAD=X",
-            "EURAUD=X", "XAUEUR=X", "BTC-USD",  "ETH-USD",
+            "EURAUD=X", "XAUEUR=X", "BTC-USD",   "ETH-USD",
         ]
 
-        self.request_count  = 0
-        self.max_requests   = 450
-        self._rate_limited  = False          # set True on first 429; cleared after backoff
-        self._rate_limit_until = 0.0         # epoch seconds — don't fetch before this
-
-        # ── Strategy parameters (matching Pine Script inputs) ──────────
-        self.lookback               = int(os.environ.get("LOOKBACK",             "50"))
+        # ── Strategy parameters (env-overridable, matching Pine inputs) ─
+        self.lookback               = int(os.environ.get("LOOKBACK",            "50"))
         self.stationarity_threshold = float(os.environ.get("STATIONARITY_THRESH","0.05"))
-        self.zscore_threshold       = float(os.environ.get("ZSCORE_THRESH",      "1.5"))
-        self.trend_ma_period        = int(os.environ.get("TREND_MA_PERIOD",      "20"))
-        self.sma_slope_period       = int(os.environ.get("SMA_SLOPE_PERIOD",     "5"))
-        self.max_sma_slope_percent  = float(os.environ.get("MAX_SMA_SLOPE_PCT",  "0.25"))
-        self.min_sma_distance_ticks = int(os.environ.get("MIN_SMA_DIST_TICKS",  "500"))
+        self.zscore_threshold       = float(os.environ.get("ZSCORE_THRESH",     "1.5"))
+        self.trend_ma_period        = int(os.environ.get("TREND_MA_PERIOD",     "20"))
+        self.sma_slope_period       = int(os.environ.get("SMA_SLOPE_PERIOD",    "5"))
+        self.max_sma_slope_percent  = float(os.environ.get("MAX_SMA_SLOPE_PCT", "0.25"))
+        self.min_sma_distance_ticks = int(os.environ.get("MIN_SMA_DIST_TICKS", "500"))
 
         # ── Timeframes ────────────────────────────────────────────────
-        self.timeframe      = os.environ.get("TIMEFRAME",     "1h")
-        self.htf_timeframe  = os.environ.get("HTF_TIMEFRAME", "4h")
-        self.data_range     = os.environ.get("DATA_RANGE",    "1mo")
-        self.htf_data_range = os.environ.get("HTF_DATA_RANGE","3mo")
+        # yfinance supports: 1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo
+        # 4h is NOT native — we download 1h and resample (see fetch_closes)
+        self.timeframe     = os.environ.get("TIMEFRAME",     "1h")
+        self.htf_timeframe = os.environ.get("HTF_TIMEFRAME", "4h")
 
-        # ── Min tick per symbol ───────────────────────────────────────
+        # ── Min tick per symbol (for SMA distance filter) ─────────────
         self.symbol_min_tick = {
             "EURUSD=X": 0.0001, "GBPJPY=X": 0.01,   "AUDJPY=X": 0.01,
             "XAUUSD=X": 0.01,   "USDCAD=X": 0.0001, "GBPUSD=X": 0.0001,
@@ -147,21 +123,24 @@ class FibSMATradingBot:
             "ETH-USD":  0.01,
         }
 
-        # ── Sessions ──────────────────────────────────────────────────
+        # ── Sessions (UTC) ────────────────────────────────────────────
         self.sessions = {
             "asia":    {"open": 23, "close": 8,  "name": "Asian Session"},
             "london":  {"open": 7,  "close": 16, "name": "London Session"},
             "newyork": {"open": 13, "close": 22, "name": "New York Session"},
         }
 
-        # ── Minimum bars ──────────────────────────────────────────────
+        # ── Minimum bars needed ───────────────────────────────────────
         self.min_bars     = max(200, self.lookback, 50 + self.sma_slope_period)
         self.min_htf_bars = self.trend_ma_period
 
-        self._series_cache: dict = {}
+        # ── Series cache (avoids re-downloading within same scan cycle) ─
+        self._series_cache:   dict = {}
+        self._cache_ttl_seconds    = int(os.environ.get("CACHE_TTL_S", str(20 * 60)))
+
         self.db = self.init_firebase()
 
-    # ── Firebase ──────────────────────────────
+    # ── Firebase ──────────────────────────────────────────────────────
 
     def init_firebase(self):
         try:
@@ -176,7 +155,9 @@ class FibSMATradingBot:
                     os.unlink(tmp)
                     print("✅ Firebase initialised from env var")
                 else:
-                    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serviceAccountKey.json")
+                    path = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), "serviceAccountKey.json"
+                    )
                     firebase_admin.initialize_app(credentials.Certificate(path))
                     print("✅ Firebase initialised from local file")
             else:
@@ -200,7 +181,7 @@ class FibSMATradingBot:
             print(f"❌ Firebase save error: {e}")
             return False
 
-    # ── Session helpers ────────────────────────
+    # ── Session helpers ───────────────────────────────────────────────
 
     def get_current_session(self):
         h = datetime.utcnow().hour
@@ -214,88 +195,93 @@ class FibSMATradingBot:
                     return sid
         return "off_hours"
 
-    # ── Data fetching ──────────────────────────
+    # ── Data fetching via yfinance ────────────────────────────────────
 
-    def get_historical_data(self, symbol, interval="1h", range="1mo"):
-        if self.request_count >= self.max_requests:
-            print(f"⚠️  Monthly request limit reached for {symbol}")
-            return None
+    def _resample_1h_to_4h(self, df: pd.DataFrame) -> list:
+        """Resample a 1H yfinance DataFrame to 4H close prices."""
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        resampled = df["Close"].resample("4h").last().dropna()
+        return resampled.tolist()
 
-        # Honour active rate-limit backoff
-        wait = self._rate_limit_until - time.time()
-        if wait > 0:
-            print(f"⏳ Rate-limit backoff — waiting {wait:.0f}s before retrying…")
-            time.sleep(wait)
-            self._rate_limited = False
+    def fetch_closes(self, symbol: str, interval: str, min_len: int) -> list:
+        """
+        Download close-price series using yfinance.
 
-        url = f"{self.base_url}/api/stock/get-chart"
-        params = {"symbol": symbol, "interval": interval, "range": range, "region": "US"}
-        try:
-            print(f"📊 Fetching {interval} data for {symbol} (range={range})…")
-            resp = requests.get(url, headers=self.headers, params=params)
-            self.request_count += 1
-            time.sleep(1.2)  # throttle: max ~50 req/min, well within typical RapidAPI limits
+        Key facts about yfinance limits (no API key needed):
+          • 1h  data  — up to 730 days back
+          • 15m data  — up to 60 days back
+          • 4h        — NOT a native interval; we download 1h + resample to 4H
+          • No monthly cap, no hard rate limit (be polite with sleep between calls)
 
-            if resp.status_code == 200:
-                self._rate_limited = False
-                return resp.json()
-
-            if resp.status_code == 429:
-                # Respect Retry-After header if present, else back off 60 s
-                retry_after = int(resp.headers.get("Retry-After", 60))
-                self._rate_limit_until = time.time() + retry_after
-                self._rate_limited = True
-                print(f"🚫 429 Rate limit hit for {symbol} — backing off {retry_after}s "
-                      f"(until {datetime.utcfromtimestamp(self._rate_limit_until).strftime('%H:%M:%S')} UTC)")
-                return None  # caller must not retry immediately
-
-            print(f"⚠️  API error {resp.status_code} for {symbol}")
-
-        except Exception as e:
-            print(f"❌ Fetch error for {symbol}: {e}")
-        return None
-
-    def extract_close_prices(self, hist_data):
-        try:
-            quotes = hist_data["chart"]["result"][0]["indicators"]["quote"][0]
-            return [p for p in quotes.get("close", []) if p is not None]
-        except Exception:
-            return []
-
-    def get_close_series(self, symbol, *, interval, preferred_range, min_len,
-                         max_age_seconds=1200):
-        key = (symbol, interval)
-        cached = self._series_cache.get(key)
+        Returns a plain Python list of floats, oldest → newest.
+        """
+        cache_key = (symbol, interval)
+        cached    = self._series_cache.get(cache_key)
         if cached:
             try:
                 age = (datetime.utcnow() - datetime.fromisoformat(cached["fetched_at"])).total_seconds()
-                if age <= max_age_seconds and len(cached["closes"]) >= min_len:
+                if age <= self._cache_ttl_seconds and len(cached["closes"]) >= min_len:
+                    print(f"   📦 Cache hit: {symbol} {interval} ({len(cached['closes'])} bars)")
                     return cached["closes"]
             except Exception:
                 pass
-        ranges = [preferred_range, "3mo", "6mo", "1y", "2y"]
-        best = []
-        for r in ranges:
-            closes = self.extract_close_prices(
-                self.get_historical_data(symbol, interval=interval, range=r)
-            )
-            if len(closes) > len(best):
-                best = closes
-            if len(closes) >= min_len:
-                break
-            # Stop retrying ranges if we just got rate-limited — no point hammering
-            if self._rate_limited:
-                print(f"   ⏸  Rate-limited — skipping remaining range retries for {symbol}/{interval}")
-                break
-        self._series_cache[key] = {"closes": best, "fetched_at": datetime.utcnow().isoformat()}
-        return best
 
-    # ── Stationarity ──────────────────────────
+        closes = []
 
-    def check_stationarity(self, prices, verbose=True):
+        # ── 4H: download 1H then resample ────────────────────────────
+        if interval == "4h":
+            for period in ["60d", "730d"]:
+                try:
+                    print(f"📊 yfinance: {symbol} 1h→4H resample (period={period})…")
+                    df = yf.download(
+                        symbol, interval="1h", period=period,
+                        auto_adjust=True, progress=False, threads=False
+                    )
+                    if df.empty:
+                        continue
+                    closes = self._resample_1h_to_4h(df)
+                    if len(closes) >= min_len:
+                        break
+                except Exception as e:
+                    print(f"   ⚠️  yfinance 4h error for {symbol}: {e}")
+
+        # ── Native intervals (1h, 15m, 1d …) ─────────────────────────
+        else:
+            periods_map = {
+                "1h":  ["60d", "730d"],
+                "15m": ["60d"],
+                "1d":  ["2y", "5y"],
+            }
+            for period in periods_map.get(interval, ["60d", "730d"]):
+                try:
+                    print(f"📊 yfinance: {symbol} {interval} (period={period})…")
+                    df = yf.download(
+                        symbol, interval=interval, period=period,
+                        auto_adjust=True, progress=False, threads=False
+                    )
+                    if df.empty:
+                        continue
+                    closes = df["Close"].dropna().tolist()
+                    if len(closes) >= min_len:
+                        break
+                except Exception as e:
+                    print(f"   ⚠️  yfinance error for {symbol} {interval}: {e}")
+
+        self._series_cache[cache_key] = {
+            "closes":     closes,
+            "fetched_at": datetime.utcnow().isoformat(),
+        }
+        return closes
+
+    # ── Stationarity check ────────────────────────────────────────────
+
+    def check_stationarity(self, prices: list, verbose: bool = True):
         """
-        Multi-method approximation of ADF stationarity test.
-        Pine Script hardcodes p_value = 0.01; here we compute it properly.
+        Multi-method stationarity check.
+        Pine Script hardcodes p_value=0.01 (always passes the gate).
+        Here we run a real ADF test combined with 3 supporting checks
+        so the bot only trades genuinely mean-reverting conditions.
         Returns (final_p_value, is_stationary).
         """
         try:
@@ -306,36 +292,36 @@ class FibSMATradingBot:
 
             # 1. Augmented Dickey-Fuller
             try:
-                adf_p = adfuller(arr, autolag="AIC")[1]
+                adf_p  = adfuller(arr, autolag="AIC")[1]
                 adf_ok = adf_p < self.stationarity_threshold
             except Exception:
                 adf_p, adf_ok = 1.0, False
 
             # 2. Linear trend strength
-            x = np.arange(len(arr))
-            slope = stats.linregress(x, arr).slope
+            x              = np.arange(len(arr))
+            slope          = stats.linregress(x, arr).slope
             trend_strength = abs(slope) / (np.std(arr) + 1e-10)
             no_strong_trend = trend_strength <= 0.1
 
             # 3. Rolling-mean stability
-            rolling_mean = pd.Series(arr).rolling(10).mean()
+            rolling_mean   = pd.Series(arr).rolling(10).mean()
             mean_variation = rolling_mean.std() / (abs(rolling_mean.mean()) + 1e-10)
-            mean_stable = mean_variation < 0.05
+            mean_stable    = mean_variation < 0.05
 
             # 4. Mean-reversion cross rate
-            m = arr.mean()
+            m       = arr.mean()
             crosses = sum(
                 1 for i in range(1, len(arr))
                 if (arr[i - 1] - m) * (arr[i] - m) < 0
             )
-            cross_rate = crosses / len(arr)
+            cross_rate     = crosses / len(arr)
             mean_reverting = cross_rate > 0.15
 
             is_stationary = adf_ok and no_strong_trend and mean_stable and mean_reverting
-            final_p = max(adf_p, 1.0 - cross_rate)
+            final_p       = max(adf_p, 1.0 - cross_rate)
 
             if verbose:
-                print(f"   Stationarity — ADF p={adf_p:.4f}  trend_strength={trend_strength:.3f}"
+                print(f"   Stationarity — ADF p={adf_p:.4f}  trend={trend_strength:.3f}"
                       f"  mean_var={mean_variation:.3f}  cross_rate={cross_rate:.3f}"
                       f"  → stationary={is_stationary}")
             return final_p, is_stationary
@@ -344,32 +330,32 @@ class FibSMATradingBot:
             print(f"⚠️  Stationarity error: {e}")
             return 1.0, False
 
-    # ── Signal logic — direct Pine translation ─
+    # ── Core signal logic — direct Pine Script translation ─────────────
 
-    def check_signals(self, symbol, prices, htf_prices, verbose=True):
+    def check_signals(self, symbol: str, prices: list, htf_prices: list,
+                      verbose: bool = True) -> list:
         """
-        Pine Script variable → Python variable mapping:
-
-            close               prices[-1]
-            htf_close           htf_prices[-1]
-            is_stationary       check_stationarity()
-            sma_lookback        rolling(lookback).mean().iloc[-1]
-            stddev_lookback     rolling(lookback).std(ddof=0).iloc[-1]
-            zscore              (close - sma_lookback) / stddev_lookback
-            htf_sma             rolling(trend_ma_period).mean() on htf series
-            htf_trend_bullish   htf_close > htf_sma
-            sma50 / sma200      rolling 50/200 on 1H prices
-            bullish_trend       sma50 > sma200
-            sma50_pct_change    (sma50 - sma50[slope_period]) / sma50[slope_period] * 100
-            sma_slope_ok        abs(sma50_pct_change) <= max_sma_slope_percent
-            sma_distance_ticks  abs(sma50 - sma200) / mintick
-            sma_distance_ok     sma_distance_ticks >= min_sma_distance_ticks
-            bullish_valid       bullish_trend and sma_distance_ok and sma_slope_ok
-            bearish_valid       bearish_trend and sma_distance_ok and sma_slope_ok
-            entry_long          is_stationary and zscore<-t and htf_bullish and bullish_valid
-            entry_short         is_stationary and zscore>+t and htf_bearish and bearish_valid
-            exit_long           zscore>+t and bearish_valid
-            exit_short          zscore<-t and bullish_valid
+        Pine → Python variable map:
+            close              prices[-1]
+            htf_close          htf_prices[-1]
+            is_stationary      check_stationarity()
+            sma_lookback       rolling(lookback).mean().iloc[-1]
+            stddev_lookback    rolling(lookback).std(ddof=0).iloc[-1]
+            zscore             (close - sma_lookback) / stddev_lookback
+            htf_sma            rolling(trend_ma_period).mean() on htf series
+            htf_trend_bullish  htf_close > htf_sma
+            sma50 / sma200     rolling 50/200 on prices
+            bullish_trend      sma50 > sma200
+            sma50_pct_change   (sma50-sma50[slope_period])/sma50[slope_period]*100
+            sma_slope_ok       abs(sma50_pct_change) <= max_sma_slope_percent
+            sma_distance_ticks abs(sma50-sma200) / mintick
+            sma_distance_ok    sma_distance_ticks >= min_sma_distance_ticks
+            bullish_valid      bullish_trend and sma_distance_ok and sma_slope_ok
+            bearish_valid      bearish_trend and sma_distance_ok and sma_slope_ok
+            entry_long         is_stationary and z<-t and htf_bullish and bullish_valid
+            entry_short        is_stationary and z>+t and htf_bearish and bearish_valid
+            exit_long          z>+t and bearish_valid
+            exit_short         z<-t and bullish_valid
         """
         min_required = max(200, self.lookback, 50 + self.sma_slope_period)
         if len(prices) < min_required:
@@ -378,7 +364,8 @@ class FibSMATradingBot:
             return []
         if len(htf_prices) < self.trend_ma_period:
             if verbose:
-                print(f"   ⚠️  Insufficient HTF data: {len(htf_prices)} bars (need {self.trend_ma_period})")
+                print(f"   ⚠️  Insufficient HTF data: {len(htf_prices)} bars "
+                      f"(need {self.trend_ma_period})")
             return []
 
         closes     = pd.Series(prices,     dtype="float64")
@@ -388,18 +375,18 @@ class FibSMATradingBot:
         p_value, is_stationary = self.check_stationarity(prices, verbose=verbose)
 
         # ── Z-score ───────────────────────────────────────────────────
-        sma_lb  = closes.rolling(self.lookback).mean().iloc[-1]
-        std_lb  = closes.rolling(self.lookback).std(ddof=0).iloc[-1]
+        sma_lb = closes.rolling(self.lookback).mean().iloc[-1]
+        std_lb = closes.rolling(self.lookback).std(ddof=0).iloc[-1]
         if pd.isna(sma_lb) or pd.isna(std_lb) or std_lb == 0:
             if verbose:
                 print("   ⚠️  NaN / zero std in z-score calc")
             return []
         current_price = float(closes.iloc[-1])
-        zscore = (current_price - float(sma_lb)) / float(std_lb)
+        zscore        = (current_price - float(sma_lb)) / float(std_lb)
 
         # ── HTF trend ─────────────────────────────────────────────────
-        htf_sma_s   = htf_closes.rolling(self.trend_ma_period).mean()
-        htf_sma_val = htf_sma_s.iloc[-1]
+        htf_sma_s     = htf_closes.rolling(self.trend_ma_period).mean()
+        htf_sma_val   = htf_sma_s.iloc[-1]
         htf_close_val = float(htf_closes.iloc[-1])
         if pd.isna(htf_sma_val):
             if verbose:
@@ -422,19 +409,17 @@ class FibSMATradingBot:
         bearish_trend = sma50 < sma200
 
         # ── SMA slope filter ──────────────────────────────────────────
-        # Pine: (sma50 - sma50[sma_slope_period]) / sma50[sma_slope_period] * 100
         prev_sma50 = float(sma50_s.iloc[-1 - self.sma_slope_period]) \
             if len(sma50_s) > self.sma_slope_period else sma50
         sma50_pct_change = ((sma50 - prev_sma50) / prev_sma50 * 100) if prev_sma50 != 0 else 0.0
-        sma_slope_ok = abs(sma50_pct_change) <= self.max_sma_slope_percent
+        sma_slope_ok     = abs(sma50_pct_change) <= self.max_sma_slope_percent
 
         # ── SMA distance filter ───────────────────────────────────────
-        # Pine: math.abs(sma50 - sma200) / syminfo.mintick
-        min_tick = self.symbol_min_tick.get(symbol, 0.0001)
+        min_tick           = self.symbol_min_tick.get(symbol, 0.0001)
         sma_distance_ticks = abs(sma50 - sma200) / min_tick
         sma_distance_ok    = sma_distance_ticks >= self.min_sma_distance_ticks
 
-        # ── Combined validity ─────────────────────────────────────────
+        # ── Combined trend validity ───────────────────────────────────
         bullish_valid = bullish_trend and sma_distance_ok and sma_slope_ok
         bearish_valid = bearish_trend and sma_distance_ok and sma_slope_ok
 
@@ -454,7 +439,7 @@ class FibSMATradingBot:
         exit_long   = zscore >  self.zscore_threshold and bearish_valid
         exit_short  = zscore < -self.zscore_threshold and bullish_valid
 
-        # ── Build signals ─────────────────────────────────────────────
+        # ── Build signal payloads ─────────────────────────────────────
         ctx = {
             "price":               current_price,
             "zscore":              float(zscore),
@@ -475,7 +460,8 @@ class FibSMATradingBot:
 
         signals = []
         def add(sig_type, sig_name, confidence):
-            signals.append({"type": sig_type, "signal": sig_name, "confidence": confidence, **ctx})
+            signals.append({"type": sig_type, "signal": sig_name,
+                            "confidence": confidence, **ctx})
             if verbose:
                 print(f"   🎯 {sig_type} — {sig_name}")
 
@@ -489,84 +475,72 @@ class FibSMATradingBot:
 
         return signals
 
-    # ── Watchlist scan ─────────────────────────
+    # ── Watchlist scan ────────────────────────────────────────────────
 
     def scan_watchlist(self):
         global last_check_time, total_signals
 
         print(f"\n{'='*60}")
         print(f"🚀 Scan at {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
-        print(f"   Strategy : Stationarity + Z-score + HTF SMA + SMA50/200 filters")
-        print(f"   Chart TF : {self.timeframe}  |  HTF : {self.htf_timeframe}")
+        print(f"   Strategy   : Stationarity + Z-score + HTF SMA + SMA50/200 filters")
+        print(f"   Data source: yfinance (free, no API key, no rate limits)")
+        print(f"   Chart TF   : {self.timeframe}  |  HTF : {self.htf_timeframe}")
         print(f"{'='*60}")
 
-        session = self.get_current_session()
+        session         = self.get_current_session()
         last_check_time = datetime.utcnow().isoformat()
-        signals_found = 0
+        signals_found   = 0
 
         for symbol in self.watchlist:
-            if self.request_count >= self.max_requests:
-                print("⚠️  Monthly request limit reached. Stopping scan.")
-                break
-
             print(f"\n🔍 {symbol}…")
             try:
-                prices = self.get_close_series(
-                    symbol, interval=self.timeframe,
-                    preferred_range=self.data_range, min_len=self.min_bars,
-                )
-                htf_prices = self.get_close_series(
-                    symbol, interval=self.htf_timeframe,
-                    preferred_range=self.htf_data_range, min_len=self.min_htf_bars,
-                )
+                prices     = self.fetch_closes(symbol, self.timeframe,     self.min_bars)
+                htf_prices = self.fetch_closes(symbol, self.htf_timeframe, self.min_htf_bars)
 
                 if len(prices) < self.min_bars:
-                    print(f"   ⚠️  Skipping: only {len(prices)} {self.timeframe} bars (need {self.min_bars})")
+                    print(f"   ⚠️  Skipping: only {len(prices)} {self.timeframe} bars "
+                          f"(need {self.min_bars})")
                     continue
                 if len(htf_prices) < self.min_htf_bars:
-                    print(f"   ⚠️  Skipping: only {len(htf_prices)} {self.htf_timeframe} bars (need {self.min_htf_bars})")
+                    print(f"   ⚠️  Skipping: only {len(htf_prices)} {self.htf_timeframe} bars "
+                          f"(need {self.min_htf_bars})")
                     continue
 
-                print(f"   📈 {self.timeframe} bars: {len(prices)}  |  {self.htf_timeframe} bars: {len(htf_prices)}")
+                print(f"   📈 {self.timeframe} bars: {len(prices)}"
+                      f"  |  {self.htf_timeframe} bars: {len(htf_prices)}")
 
                 signals = self.check_signals(symbol, prices, htf_prices, verbose=True)
 
                 for sig in signals:
-                    saved = self.save_alert_to_firebase({"symbol": symbol, "session": session, **sig})
+                    saved = self.save_alert_to_firebase(
+                        {"symbol": symbol, "session": session, **sig}
+                    )
                     if saved:
                         signals_found += 1
                         total_signals  += 1
 
             except Exception as e:
-                print(f"   ❌ Error: {e}")
+                print(f"   ❌ Error processing {symbol}: {e}")
 
-            # Longer pause if we're rate-limited so the window resets before next symbol
-            if self._rate_limited:
-                wait = max(0, self._rate_limit_until - time.time())
-                if wait > 0:
-                    print(f"⏳ Waiting {wait:.0f}s for rate-limit window to reset…")
-                    time.sleep(wait)
-                    self._rate_limited = False
-            else:
-                time.sleep(1.5)
+            # Small polite pause between symbols
+            time.sleep(1.0)
 
         print(f"\n{'='*60}")
-        print(f"✅ Scan done — {signals_found} new signal(s)  |  "
-              f"Requests: {self.request_count}/{self.max_requests}")
+        print(f"✅ Scan done — {signals_found} new signal(s)")
         print(f"{'='*60}")
 
 
 # ──────────────────────────────────────────────
-# Flask
+# Flask routes
 # ──────────────────────────────────────────────
 
 @app.route("/")
 def home():
     return jsonify({
-        "status": "running",
-        "last_check": last_check_time,
+        "status":        "running",
+        "data_source":   "yfinance (free, no API key)",
+        "last_check":    last_check_time,
         "total_signals": total_signals,
-        "requests_used": bot_instance.request_count if bot_instance else 0,
     })
 
 @app.route("/health")
@@ -579,6 +553,7 @@ def status():
         return jsonify({"error": "Bot not initialised"}), 500
     return jsonify({
         "status":              "running",
+        "data_source":         "yfinance (free, no API key)",
         "strategy":            "Stationarity Z-score + HTF SMA + SMA50/200 filters",
         "timeframe":           bot_instance.timeframe,
         "htf_timeframe":       bot_instance.htf_timeframe,
@@ -589,8 +564,6 @@ def status():
         "current_time_utc":    datetime.utcnow().isoformat(),
         "last_check":          last_check_time,
         "total_signals":       total_signals,
-        "requests_used":       bot_instance.request_count,
-        "requests_remaining":  bot_instance.max_requests - bot_instance.request_count,
         "watchlist":           bot_instance.watchlist,
     })
 
@@ -605,20 +578,17 @@ def run_bot():
             bot_instance.scan_watchlist()
         except Exception as e:
             print(f"❌ Bot scan error: {e}")
+        print("💤 Sleeping 10 minutes until next scan…")
         time.sleep(600)
 
 
 if __name__ == "__main__":
-    print("🚀 Initialising Stationarity Trading Bot…")
+    print("🚀 Initialising Stationarity Trading Bot (yfinance edition)…")
     print(f"Python : {sys.version}")
     print(f"UTC    : {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}")
+    print("📡 Data source: yfinance — free, no API key, no rate limits, no monthly cap")
 
-    API_KEY = os.environ.get("RAPIDAPI_KEY")
-    if not API_KEY:
-        print("❌ RAPIDAPI_KEY not set")
-        sys.exit(1)
-
-    bot_instance = FibSMATradingBot(API_KEY)
+    bot_instance = FibSMATradingBot()          # ← no API key argument needed
 
     write_startup_test_to_firebase(bot_instance.db, bot=bot_instance)
 

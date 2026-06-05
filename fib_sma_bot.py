@@ -318,7 +318,9 @@ class SRStationarityBot:
         is_red = is_bear_break | is_bear_wick
         is_blue = is_bull_break | is_bull_wick
 
-        is_stationary = 0.01 < self.stationarity_threshold
+        # Stationarity: always True (p_value=0.01 < threshold=0.05), matches Pine
+        is_stationary = bool(0.01 < self.stationarity_threshold)
+
         closes = pd.Series(c, dtype=float)
         sma_lb = closes.rolling(self.lookback).mean().to_numpy()
         std_lb = closes.rolling(self.lookback).std(ddof=0).to_numpy()
@@ -332,31 +334,52 @@ class SRStationarityBot:
 
         sma50 = closes.rolling(50).mean().to_numpy()
         sma200 = closes.rolling(200).mean().to_numpy()
-        sma50_prev = np.roll(sma50, self.sma_slope_period)
+
+        sma50_prev = np.full(n, np.nan)
+        if n > self.sma_slope_period:
+            sma50_prev[self.sma_slope_period:] = sma50[: n - self.sma_slope_period]
         with np.errstate(divide="ignore", invalid="ignore"):
-            sma50_pct = np.where(sma50_prev != 0, (sma50 - sma50_prev) / sma50_prev * 100.0, 0.0)
+            sma50_pct = np.where(
+                (~np.isnan(sma50_prev)) & (sma50_prev != 0),
+                (sma50 - sma50_prev) / sma50_prev * 100.0,
+                0.0,
+            )
         sma_slope_ok = np.abs(sma50_pct) <= self.max_sma_slope_percent
-        sma_dist = np.abs(sma50 - sma200) / min_tick
-        sma_dist_ok = sma_dist >= self.min_sma_distance_ticks
+
+        sma_dist_ticks = np.abs(sma50 - sma200) / min_tick
+
+        price_ref = c[n - 1] if not np.isnan(c[n - 1]) else 1.0
+        if min_tick <= 0.00001:
+            effective_min_dist_ticks = self.min_sma_distance_ticks
+        elif min_tick <= 0.001:
+            effective_min_dist_ticks = self.min_sma_distance_ticks * (0.00001 / min_tick)
+        else:
+            effective_min_dist_ticks = (price_ref * 0.0005) / min_tick
+
+        sma_dist_ok = sma_dist_ticks >= effective_min_dist_ticks
         bull_valid = (sma50 > sma200) & sma_dist_ok & sma_slope_ok
         bear_valid = (sma50 < sma200) & sma_dist_ok & sma_slope_ok
 
         entry_long = is_stationary & (zscore < -self.zscore_threshold) & htf_bull & bull_valid
         entry_short = is_stationary & (zscore > self.zscore_threshold) & htf_bear & bear_valid
+
         dist_sup = np.abs(c - low_use)
         dist_res = np.abs(c - high_use)
         show_buy = is_blue & entry_long & (dist_res <= buffer_price)
         show_sell = is_red & entry_short & (dist_sup <= buffer_price)
 
-        start_i = max(1, n - self.edge_lookback_bars)
         signals = []
+        start_i = max(1, n - self.edge_lookback_bars)
+
         for i in range(start_i, n):
             buy_edge = bool(show_buy[i] and not show_buy[i - 1])
             sell_edge = bool(show_sell[i] and not show_sell[i - 1])
             if not buy_edge and not sell_edge:
                 continue
+
             bar_ts = pd.Timestamp(m1.index[i]).tz_convert("UTC")
             bar_time_iso = bar_ts.isoformat().replace("+00:00", "Z")
+
             ctx = {
                 "price": float(c[i]),
                 "zscore": float(zscore[i]) if not np.isnan(zscore[i]) else None,
@@ -374,22 +397,47 @@ class SRStationarityBot:
                 "htf_timeframe": self.htf_timeframe,
                 "volume_osc": float(osc[i]),
                 "bar_time": bar_time_iso,
+                "sma_dist_ticks": float(sma_dist_ticks[i]) if not np.isnan(sma_dist_ticks[i]) else None,
+                "effective_min_dist": float(effective_min_dist_ticks),
+                "sma_slope_pct": float(sma50_pct[i]) if not np.isnan(sma50_pct[i]) else None,
             }
+
             if buy_edge and not db_alerts.alert_exists(symbol, "BUY", bar_time_iso):
-                signals.append({"type": "BUY", "signal": "sr_break_stationarity_buy_triangle", "confidence": "HIGH", **ctx})
+                signals.append({
+                    "type": "BUY",
+                    "signal": "sr_break_stationarity_buy_triangle",
+                    "confidence": "HIGH",
+                    **ctx,
+                })
                 if verbose:
-                    print(f"   🎯 BUY @ {bar_time_iso} price={c[i]:.5f} z={zscore[i]:.2f}")
+                    print(
+                        f"   🎯 BUY  @ {bar_time_iso} price={c[i]:.5f} z={zscore[i]:.2f} "
+                        f"dist_ok={sma_dist_ok[i]} slope_ok={sma_slope_ok[i]}"
+                    )
+
             if sell_edge and not db_alerts.alert_exists(symbol, "SELL", bar_time_iso):
-                signals.append({"type": "SELL", "signal": "sr_break_stationarity_sell_triangle", "confidence": "HIGH", **ctx})
+                signals.append({
+                    "type": "SELL",
+                    "signal": "sr_break_stationarity_sell_triangle",
+                    "confidence": "HIGH",
+                    **ctx,
+                })
                 if verbose:
-                    print(f"   🎯 SELL @ {bar_time_iso} price={c[i]:.5f} z={zscore[i]:.2f}")
+                    print(
+                        f"   🎯 SELL @ {bar_time_iso} price={c[i]:.5f} z={zscore[i]:.2f} "
+                        f"dist_ok={sma_dist_ok[i]} slope_ok={sma_slope_ok[i]}"
+                    )
 
         if verbose and not signals:
             i = n - 1
             print(f"   Bar {m1.index[i]} close={c[i]:.5f} mintick={min_tick} buffer={buffer_price:.6f}")
             print(f"   S/R R={high_use[i]:.5f} S={low_use[i]:.5f} | blue={is_blue[i]} red={is_red[i]}")
             print(f"   entry_L={entry_long[i]} entry_S={entry_short[i]} distR={dist_res[i]:.6f} distS={dist_sup[i]:.6f}")
-            print(f"   sma_dist_ticks={sma_dist[i]:.0f} (need>={self.min_sma_distance_ticks}) slope_ok={sma_slope_ok[i]}")
+            print(
+                f"   sma_dist_ticks={sma_dist_ticks[i]:.0f} "
+                f"(eff_min={effective_min_dist_ticks:.0f}) slope_ok={sma_slope_ok[i]}"
+            )
+            print(f"   bull_valid={bull_valid[i]} bear_valid={bear_valid[i]}")
             print(f"   show_buy={show_buy[i]} show_sell={show_sell[i]}")
             print("   ℹ️  No new triangle alert in lookback window")
 

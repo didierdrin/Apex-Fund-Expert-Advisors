@@ -139,6 +139,8 @@ class FibSMATradingBot:
         # Trading parameters
         self.check_interval = 10  # minutes
         self.session_active_hours = 3
+        # Refresh cached OHLC before each scan (scan runs every 10 minutes)
+        self.price_cache_max_age_seconds = 9 * 60
         self.timeframe = '1h'
         self.htf_timeframe = '4h'
         self.data_range = '1mo'
@@ -244,15 +246,21 @@ class FibSMATradingBot:
             return False
         
         try:
-            # Add timestamp if not present
-            if 'timestamp' not in alert_data:
-                alert_data['timestamp'] = datetime.now().isoformat()
-            
-            # Add session info
+            now_utc = datetime.utcnow()
             current_session = self.get_current_session()
             alert_data['session'] = current_session
+            # Numeric + server timestamps so web/mobile orderBy queries always see new docs
+            alert_data['timestamp_ms'] = int(now_utc.timestamp() * 1000)
+            alert_data['timestamp_iso'] = now_utc.isoformat() + 'Z'
+            alert_data['timestamp'] = firestore.SERVER_TIMESTAMP
+
+            # Firestore rejects numpy scalar types
+            for key, value in list(alert_data.items()):
+                if isinstance(value, (np.bool_, np.integer, np.floating)):
+                    alert_data[key] = value.item()
+                elif isinstance(value, np.ndarray):
+                    alert_data[key] = value.tolist()
             
-            # Add to firestore
             doc_ref = self.db.collection('trading_alerts').document()
             doc_ref.set(alert_data)
             print(f"✅ Alert saved to Firebase: {alert_data['symbol']} - {alert_data['type']} ({current_session})")
@@ -341,7 +349,9 @@ class FibSMATradingBot:
                         prices = [p for p in quotes['close'] if p is not None]
         return prices
 
-    def get_close_series(self, symbol, *, interval, preferred_range, min_len, ranges_to_try=None, max_age_seconds=60 * 20):
+    def get_close_series(self, symbol, *, interval, preferred_range, min_len, ranges_to_try=None, max_age_seconds=None):
+        if max_age_seconds is None:
+            max_age_seconds = self.price_cache_max_age_seconds
         """
         Return a list of close prices for a symbol/interval.
 
@@ -660,10 +670,13 @@ class FibSMATradingBot:
         print(f"\n{'='*60}")
         print(f"🚀 Scan started at {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
         print(f"{'='*60}")
+
+        # Force fresh market data each scan (stale cache blocked new alerts between runs)
+        self._series_cache.clear()
         
         # 24/7 scan — no session window gate. Session name is only stored on alerts for context.
         current_session = self.get_current_session()
-        last_check_time = datetime.now().isoformat()
+        last_check_time = datetime.utcnow().isoformat() + 'Z'
 
         if current_session in self.sessions:
             sess_label = self.sessions[current_session]['name']
@@ -822,6 +835,12 @@ if __name__ == "__main__":
 
     # One-time startup test write (verify Firebase console receives data)
     write_startup_test_to_firebase(bot_instance.db, bot=bot_instance)
+
+    run_once = os.environ.get("BOT_RUN_ONCE", "").lower() in ("1", "true", "yes")
+    if run_once:
+        print("🏁 BOT_RUN_ONCE: running a single watchlist scan then exiting")
+        bot_instance.scan_watchlist()
+        sys.exit(0)
     
     # Start bot in background thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)

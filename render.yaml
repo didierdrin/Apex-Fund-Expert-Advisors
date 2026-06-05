@@ -1,7 +1,6 @@
-# render.yaml - Configuration for Python Trading Bot only
+# render.yaml - SR Break + Stationarity bot (yfinance, 1m)
 
 services:
-  # Cron Job for the Python Trading Bot
   - type: cron
     name: fib-trading-bot
     runtime: python
@@ -9,15 +8,19 @@ services:
     branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: python fib_sma_bot.py
-    schedule: "*/30 * * * *"  # Runs every 30 minutes
+    schedule: "*/3 * * * *"  # Every 3 minutes (1m strategy)
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.18
-      - key: RAPIDAPI_KEY
-        sync: false  # You'll set this manually in Render dashboard
       - key: FIREBASE_SERVICE_ACCOUNT
-        sync: false  # You'll set this manually in Render dashboard
-      - key: RENDER
-        value: true  # Let's the bot know it's running on Render
+        sync: false
+      - key: BOT_RUN_ONCE
+        value: true
+      - key: TIMEFRAME
+        value: 1m
+      - key: HTF_TIMEFRAME
+        value: 15m
+      - key: SCAN_INTERVAL_S
+        value: 60
       - key: PYTHONUNBUFFERED
-        value: 1  # Ensures logs are output immediately
+        value: 1

@@ -1,26 +1,27 @@
-# render.yaml - SR Break + Stationarity bot (yfinance, 1m)
+# SR Break + Stationarity bot - web service + background 1m scanner
 
 services:
-  - type: cron
+  - type: web
     name: fib-trading-bot
     runtime: python
-    repo: https://github.com/didierdrin/fib-trading-bot
+    repo: https://github.com/didierdrin/Apex-Fund-Expert-Advisors
     branch: main
     buildCommand: pip install -r requirements.txt
-    startCommand: python fib_sma_bot.py
-    schedule: "*/3 * * * *"  # Every 3 minutes (1m strategy)
+    startCommand: gunicorn fib_sma_bot:app --bind 0.0.0.0:$PORT --workers 1 --timeout 300
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.18
-      - key: FIREBASE_SERVICE_ACCOUNT
+      - key: DATABASE_URL
         sync: false
-      - key: BOT_RUN_ONCE
-        value: true
       - key: TIMEFRAME
         value: 1m
       - key: HTF_TIMEFRAME
         value: 15m
+      - key: HTF_MINUTES
+        value: 15
       - key: SCAN_INTERVAL_S
-        value: 60
+        value: 120
+      - key: EDGE_LOOKBACK_BARS
+        value: 20
       - key: PYTHONUNBUFFERED
         value: 1

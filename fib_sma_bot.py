@@ -30,6 +30,58 @@ last_check_time = None
 total_signals = 0
 _startup_test_written = False
 
+# Full watchlist: original 18 + forex crosses/exotics, crypto, indices, futures, stocks, ETFs
+WATCHLIST = [
+    # --- Original forex & crypto ---
+    "EURUSD=X", "GBPJPY=X", "AUDJPY=X", "XAUUSD=X", "USDCAD=X",
+    "GBPUSD=X", "EURJPY=X", "USDJPY=X", "AUDUSD=X", "NZDUSD=X",
+    "USDCHF=X", "EURGBP=X", "EURCAD=X", "GBPCAD=X", "AUDCAD=X",
+    "EURAUD=X", "BTC-USD", "ETH-USD",
+    # --- Extra forex crosses & metals ---
+    "EURCHF=X", "EURNZD=X", "GBPCHF=X", "GBPAUD=X", "GBPNZD=X",
+    "AUDCHF=X", "AUDNZD=X", "CADJPY=X", "CHFJPY=X", "NZDJPY=X",
+    "NZDCAD=X", "NZDCHF=X", "CADCHF=X", "XAUEUR=X", "XAUGBP=X",
+    "XAUJPY=X", "XAGUSD=X",
+    # --- USD vs EM / other ---
+    "USDMXN=X", "USDZAR=X", "USDTRY=X", "USDSEK=X", "USDNOK=X",
+    "USDDKK=X", "USDPLN=X", "USDSGD=X", "USDHKD=X", "USDCNH=X",
+    # --- Extra crypto ---
+    "SOL-USD", "BNB-USD", "XRP-USD", "ADA-USD", "DOGE-USD",
+    "DOT-USD", "AVAX-USD", "LINK-USD", "LTC-USD", "BCH-USD",
+    "MATIC-USD", "UNI-USD", "ATOM-USD", "XLM-USD", "SHIB-USD", "TRX-USD",
+    # --- Indices ---
+    "^GSPC", "^DJI", "^IXIC", "^RUT", "^VIX", "^FTSE", "^GDAXI",
+    "^FCHI", "^N225", "^HSI", "^STOXX50E",
+    # --- Commodity futures ---
+    "GC=F", "SI=F", "CL=F", "BZ=F", "NG=F", "HG=F", "ZC=F", "ZW=F",
+    # --- US stocks ---
+    "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "TSLA",
+    "AMD", "INTC", "NFLX", "CRM", "ORCL", "IBM", "JPM", "BAC", "WFC",
+    "GS", "V", "MA", "JNJ", "UNH", "PFE", "XOM", "CVX", "WMT", "HD",
+    "DIS", "KO", "PEP", "NKE", "BA", "COIN", "MSTR",
+    # --- ETFs ---
+    "SPY", "QQQ", "DIA", "IWM", "XLF", "XLE", "XLK", "GLD", "SLV", "USO",
+]
+
+FOREX_MIN_TICK = {
+    "EURUSD=X": 0.0001, "GBPJPY=X": 0.01, "AUDJPY=X": 0.01, "XAUUSD=X": 0.01,
+    "USDCAD=X": 0.0001, "GBPUSD=X": 0.0001, "EURJPY=X": 0.01, "USDJPY=X": 0.01,
+    "AUDUSD=X": 0.0001, "NZDUSD=X": 0.0001, "USDCHF=X": 0.0001, "EURGBP=X": 0.0001,
+    "EURCAD=X": 0.0001, "GBPCAD=X": 0.0001, "AUDCAD=X": 0.0001, "EURAUD=X": 0.0001,
+    "EURCHF=X": 0.0001, "EURNZD=X": 0.0001, "GBPCHF=X": 0.0001, "GBPAUD=X": 0.0001,
+    "GBPNZD=X": 0.0001, "AUDCHF=X": 0.0001, "AUDNZD=X": 0.0001, "CADJPY=X": 0.01,
+    "CHFJPY=X": 0.01, "NZDJPY=X": 0.01, "NZDCAD=X": 0.0001, "NZDCHF=X": 0.0001,
+    "CADCHF=X": 0.0001, "XAUEUR=X": 0.01, "XAUGBP=X": 0.01, "XAUJPY=X": 0.01,
+    "XAGUSD=X": 0.01, "USDMXN=X": 0.0001, "USDZAR=X": 0.0001, "USDTRY=X": 0.0001,
+    "USDSEK=X": 0.0001, "USDNOK=X": 0.0001, "USDDKK=X": 0.0001, "USDPLN=X": 0.0001,
+    "USDSGD=X": 0.0001, "USDHKD=X": 0.0001, "USDCNH=X": 0.0001,
+    "BTC-USD": 0.01, "ETH-USD": 0.01, "SOL-USD": 0.01, "BNB-USD": 0.01,
+    "XRP-USD": 0.0001, "ADA-USD": 0.0001, "DOGE-USD": 0.0001, "DOT-USD": 0.01,
+    "AVAX-USD": 0.01, "LINK-USD": 0.01, "LTC-USD": 0.01, "BCH-USD": 0.01,
+    "MATIC-USD": 0.0001, "UNI-USD": 0.01, "ATOM-USD": 0.01, "XLM-USD": 0.0001,
+    "SHIB-USD": 0.00000001, "TRX-USD": 0.0001,
+}
+
 
 def write_startup_test_to_firebase(db, *, bot=None):
     global _startup_test_written
@@ -163,12 +215,7 @@ class SRStationarityBot:
     """
 
     def __init__(self):
-        self.watchlist = [
-            "EURUSD=X", "GBPJPY=X", "AUDJPY=X", "XAUUSD=X", "USDCAD=X",
-            "GBPUSD=X", "EURJPY=X", "USDJPY=X", "AUDUSD=X", "NZDUSD=X",
-            "USDCHF=X", "EURGBP=X", "EURCAD=X", "GBPCAD=X", "AUDCAD=X",
-            "EURAUD=X", "BTC-USD", "ETH-USD",
-        ]
+        self.watchlist = list(WATCHLIST)
 
         # Pine inputs
         self.toggle_breaks = os.environ.get("TOGGLE_BREAKS", "true").lower() in ("1", "true", "yes")
@@ -190,14 +237,8 @@ class SRStationarityBot:
         # 1m buffer = 6 pips (Pine); 1h would be 60 — we run 1m only
         self.buffer_pips_1m = int(os.environ.get("BUFFER_PIPS_1M", "6"))
 
-        self.symbol_min_tick = {
-            "EURUSD=X": 0.0001, "GBPJPY=X": 0.01, "AUDJPY=X": 0.01,
-            "XAUUSD=X": 0.01, "USDCAD=X": 0.0001, "GBPUSD=X": 0.0001,
-            "EURJPY=X": 0.01, "USDJPY=X": 0.01, "AUDUSD=X": 0.0001,
-            "NZDUSD=X": 0.0001, "USDCHF=X": 0.0001, "EURGBP=X": 0.0001,
-            "EURCAD=X": 0.0001, "GBPCAD=X": 0.0001, "AUDCAD=X": 0.0001,
-            "EURAUD=X": 0.0001, "BTC-USD": 0.01, "ETH-USD": 0.01,
-        }
+        self.symbol_min_tick = dict(FOREX_MIN_TICK)
+        self.symbol_sleep_seconds = float(os.environ.get("SYMBOL_SLEEP_S", "0.35"))
 
         self.sessions = {
             "asia": {"open": 23, "close": 8, "name": "Asian Session"},
@@ -499,6 +540,7 @@ class SRStationarityBot:
         print(f"🚀 Scan at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
         print("   Strategy: SR Break + Stationarity Combined (Pine port)")
         print(f"   Data: yfinance | Chart: {self.timeframe} | HTF: {self.htf_timeframe}")
+        print(f"   Symbols: {len(self.watchlist)}")
         print(f"{'='*60}")
 
         session = self.get_current_session()
@@ -528,7 +570,7 @@ class SRStationarityBot:
             except Exception as e:
                 print(f"   ❌ Error: {e}")
 
-            time.sleep(0.8)
+            time.sleep(self.symbol_sleep_seconds)
 
         print(f"\n{'='*60}")
         print(f"✅ Scan done — {signals_found} new signal(s)")

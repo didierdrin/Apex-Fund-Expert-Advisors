@@ -20,7 +20,36 @@ from flask_cors import CORS
 import db_alerts
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+_cors_origins_env = os.environ.get("CORS_ORIGINS", "*").strip()
+if _cors_origins_env == "*":
+    _cors_origins = "*"
+else:
+    _cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+
+CORS(
+    app,
+    resources={r"/*": {"origins": _cors_origins}},
+    supports_credentials=False,
+    methods=["GET", "HEAD", "OPTIONS"],
+    allow_headers=["Content-Type", "Accept", "Authorization"],
+    expose_headers=["Content-Type"],
+    max_age=86400,
+)
+
+
+@app.after_request
+def _apply_cors_headers(response):
+    """Ensure CORS headers even on errors (e.g. DB down during boot)."""
+    origin = request.headers.get("Origin")
+    if not origin:
+        return response
+    if _cors_origins == "*" or origin in _cors_origins:
+        response.headers["Access-Control-Allow-Origin"] = "*" if _cors_origins == "*" else origin
+        response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Accept, Authorization"
+        response.headers["Vary"] = "Origin"
+    return response
 
 bot_instance = None
 last_check_time = None
@@ -412,7 +441,13 @@ def ensure_services_started():
 
 @app.before_request
 def _lazy_start():
-    ensure_services_started()
+    if request.method == "OPTIONS":
+        return None
+    try:
+        ensure_services_started()
+    except Exception as exc:
+        print(f"⚠️ Service boot: {exc}")
+    return None
 
 
 FibSMATradingBot = SRStationarityBot

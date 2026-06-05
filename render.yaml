@@ -23,5 +23,7 @@ services:
         value: 120
       - key: EDGE_LOOKBACK_BARS
         value: 20
+      - key: CORS_ORIGINS
+        value: https://apex-firm.vercel.app,http://localhost:3000
       - key: PYTHONUNBUFFERED
         value: 1

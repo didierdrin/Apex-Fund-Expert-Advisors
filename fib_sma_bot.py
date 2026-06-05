@@ -215,7 +215,7 @@ class SRStationarityBot:
         self.htf_timeframe = os.environ.get("HTF_TIMEFRAME", "15m")
         self.htf_minutes = int(os.environ.get("HTF_MINUTES", "15"))
         self.buffer_pips_1m = int(os.environ.get("BUFFER_PIPS_1M", "6"))
-        self.edge_lookback_bars = int(os.environ.get("EDGE_LOOKBACK_BARS", "20"))
+        self.lookback_minutes = int(os.environ.get("LOOKBACK_MINUTES", "10"))
         self.symbol_sleep_seconds = float(os.environ.get("SYMBOL_SLEEP_S", "0.35"))
         self.scan_sleep_seconds = int(os.environ.get("SCAN_INTERVAL_S", "60"))
         self._ohlcv_cache = {}
@@ -369,7 +369,16 @@ class SRStationarityBot:
         show_sell = is_red & entry_short & (dist_sup <= buffer_price)
 
         signals = []
-        start_i = max(1, n - self.edge_lookback_bars)
+        last_bar_time = pd.Timestamp(m1.index[-1]).tz_convert("UTC")
+        cutoff_time = last_bar_time - pd.Timedelta(minutes=self.lookback_minutes)
+
+        start_i = n - 1
+        for idx in range(n - 1, 0, -1):
+            if pd.Timestamp(m1.index[idx]).tz_convert("UTC") >= cutoff_time:
+                start_i = idx
+            else:
+                break
+        start_i = max(1, start_i)
 
         for i in range(start_i, n):
             buy_edge = bool(show_buy[i] and not show_buy[i - 1])
@@ -439,7 +448,7 @@ class SRStationarityBot:
             )
             print(f"   bull_valid={bull_valid[i]} bear_valid={bear_valid[i]}")
             print(f"   show_buy={show_buy[i]} show_sell={show_sell[i]}")
-            print("   ℹ️  No new triangle alert in lookback window")
+            print("   ℹ️  No new triangle alert in lookback window (last {0} min)".format(self.lookback_minutes))
 
         return signals
 

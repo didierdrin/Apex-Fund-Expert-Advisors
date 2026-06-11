@@ -22,7 +22,7 @@ services:
       - key: SCAN_INTERVAL_S
         value: 120
       - key: LOOKBACK_MINUTES
-        value: 10
+        value: 45
       - key: CORS_ORIGINS
         value: https://apex-firm.vercel.app,http://localhost:3000
       - key: PYTHONUNBUFFERED

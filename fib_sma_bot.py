@@ -203,19 +203,19 @@ class SRStationarityBot:
         self.toggle_breaks = os.environ.get("TOGGLE_BREAKS", "true").lower() in ("1", "true", "yes")
         self.left_bars = int(os.environ.get("LEFT_BARS", "15"))
         self.right_bars = int(os.environ.get("RIGHT_BARS", "15"))
-        self.volume_thresh = float(os.environ.get("VOLUME_THRESH", "20"))
+        self.volume_thresh = float(os.environ.get("VOLUME_THRESH", "5"))
         self.lookback = int(os.environ.get("LOOKBACK", "50"))
         self.zscore_threshold = float(os.environ.get("ZSCORE_THRESH", "1.5"))
         self.trend_ma_period = int(os.environ.get("TREND_MA_PERIOD", "20"))
         self.sma_slope_period = int(os.environ.get("SMA_SLOPE_PERIOD", "5"))
-        self.max_sma_slope_percent = float(os.environ.get("MAX_SMA_SLOPE_PCT", "0.25"))
-        self.min_sma_distance_ticks = int(os.environ.get("MIN_SMA_DIST_TICKS", "500"))
+        self.max_sma_slope_percent = float(os.environ.get("MAX_SMA_SLOPE_PCT", "1.5"))
+        self.min_sma_distance_ticks = int(os.environ.get("MIN_SMA_DIST_TICKS", "50"))
         self.stationarity_threshold = float(os.environ.get("STATIONARITY_THRESH", "0.05"))
         self.timeframe = os.environ.get("TIMEFRAME", "1m")
         self.htf_timeframe = os.environ.get("HTF_TIMEFRAME", "15m")
         self.htf_minutes = int(os.environ.get("HTF_MINUTES", "15"))
-        self.buffer_pips_1m = int(os.environ.get("BUFFER_PIPS_1M", "6"))
-        self.lookback_minutes = int(os.environ.get("LOOKBACK_MINUTES", "10"))
+        self.buffer_pips_1m = int(os.environ.get("BUFFER_PIPS_1M", "2"))
+        self.lookback_minutes = int(os.environ.get("LOOKBACK_MINUTES", "45"))
         self.symbol_sleep_seconds = float(os.environ.get("SYMBOL_SLEEP_S", "0.35"))
         self.scan_sleep_seconds = int(os.environ.get("SCAN_INTERVAL_S", "60"))
         self._ohlcv_cache = {}
@@ -307,8 +307,8 @@ class SRStationarityBot:
 
         cross_up = crossover(c, high_use)
         cross_dn = crossunder(c, low_use)
-        body_bear = (o - c) < (h - o)
-        body_bull = (o - l) > (c - o)
+        body_bear = (c - o) > (h - c)   # Close lower than open AND lower wick shorter than body
+        body_bull = (c - o) > (o - l)   # Close higher than open AND upper wick shorter than body
         vol_ok = osc > self.volume_thresh
 
         is_bear_break = self.toggle_breaks & cross_dn & ~body_bear & vol_ok
@@ -369,21 +369,25 @@ class SRStationarityBot:
         show_sell = is_red & entry_short & (dist_sup <= buffer_price)
 
         signals = []
+        # Time-based lookback: lookback_minutes x 1-minute bars of history
         last_bar_time = pd.Timestamp(m1.index[-1]).tz_convert("UTC")
         cutoff_time = last_bar_time - pd.Timedelta(minutes=self.lookback_minutes)
 
-        start_i = n - 1
+        # Walk backwards to find the first bar at or after the cutoff
+        start_i = max(1, n - self.lookback_minutes)  # floor: never check fewer than lookback_minutes bars
         for idx in range(n - 1, 0, -1):
-            if pd.Timestamp(m1.index[idx]).tz_convert("UTC") >= cutoff_time:
-                start_i = idx
-            else:
+            bar_time = pd.Timestamp(m1.index[idx]).tz_convert("UTC")
+            if bar_time < cutoff_time:
+                start_i = max(1, idx + 1)
                 break
-        start_i = max(1, start_i)
+        else:
+            # All bars are within the lookback window
+            start_i = 1
 
         for i in range(start_i, n):
-            buy_edge = bool(show_buy[i] and not show_buy[i - 1])
-            sell_edge = bool(show_sell[i] and not show_sell[i - 1])
-            if not buy_edge and not sell_edge:
+            buy_signal = bool(show_buy[i])
+            sell_signal = bool(show_sell[i])
+            if not buy_signal and not sell_signal:
                 continue
 
             bar_ts = pd.Timestamp(m1.index[i]).tz_convert("UTC")
@@ -411,7 +415,7 @@ class SRStationarityBot:
                 "sma_slope_pct": float(sma50_pct[i]) if not np.isnan(sma50_pct[i]) else None,
             }
 
-            if buy_edge and not db_alerts.alert_exists(symbol, "BUY", bar_time_iso):
+            if buy_signal and not db_alerts.alert_exists(symbol, "BUY", bar_time_iso):
                 signals.append({
                     "type": "BUY",
                     "signal": "sr_break_stationarity_buy_triangle",
@@ -424,7 +428,7 @@ class SRStationarityBot:
                         f"dist_ok={sma_dist_ok[i]} slope_ok={sma_slope_ok[i]}"
                     )
 
-            if sell_edge and not db_alerts.alert_exists(symbol, "SELL", bar_time_iso):
+            if sell_signal and not db_alerts.alert_exists(symbol, "SELL", bar_time_iso):
                 signals.append({
                     "type": "SELL",
                     "signal": "sr_break_stationarity_sell_triangle",
@@ -448,7 +452,7 @@ class SRStationarityBot:
             )
             print(f"   bull_valid={bull_valid[i]} bear_valid={bear_valid[i]}")
             print(f"   show_buy={show_buy[i]} show_sell={show_sell[i]}")
-            print("   ℹ️  No new triangle alert in lookback window (last {0} min)".format(self.lookback_minutes))
+            print("   ℹ️  No new triangle alert in lookback window")
 
         return signals
 

@@ -191,10 +191,10 @@ def crossunder(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def htf_close_from_m1(closes: np.ndarray, index: pd.DatetimeIndex, minutes: int = 15) -> np.ndarray:
-    """Pine request.security close: developing HTF close built from 1m bars."""
+    """Pine request.security close: completed HTF bar closes, ffilled to 1m bars."""
     s = pd.Series(closes, index=pd.to_datetime(index, utc=True))
-    bucket = s.index.floor(f"{minutes}min")
-    return s.groupby(bucket).transform("last").to_numpy(dtype=float)
+    htf = s.resample(f"{minutes}min").last().ffill()
+    return htf.reindex(s.index, method="ffill").to_numpy(dtype=float)
 
 
 class SRStationarityBot:
@@ -203,19 +203,19 @@ class SRStationarityBot:
         self.toggle_breaks = os.environ.get("TOGGLE_BREAKS", "true").lower() in ("1", "true", "yes")
         self.left_bars = int(os.environ.get("LEFT_BARS", "15"))
         self.right_bars = int(os.environ.get("RIGHT_BARS", "15"))
-        self.volume_thresh = float(os.environ.get("VOLUME_THRESH", "5"))
+        self.volume_thresh = 20.0
         self.lookback = int(os.environ.get("LOOKBACK", "50"))
         self.zscore_threshold = float(os.environ.get("ZSCORE_THRESH", "1.5"))
         self.trend_ma_period = int(os.environ.get("TREND_MA_PERIOD", "20"))
         self.sma_slope_period = int(os.environ.get("SMA_SLOPE_PERIOD", "5"))
-        self.max_sma_slope_percent = float(os.environ.get("MAX_SMA_SLOPE_PCT", "1.5"))
-        self.min_sma_distance_ticks = int(os.environ.get("MIN_SMA_DIST_TICKS", "50"))
+        self.max_sma_slope_percent = 0.25
+        self.min_sma_distance_ticks = 500
         self.stationarity_threshold = float(os.environ.get("STATIONARITY_THRESH", "0.05"))
         self.timeframe = os.environ.get("TIMEFRAME", "1m")
         self.htf_timeframe = os.environ.get("HTF_TIMEFRAME", "15m")
         self.htf_minutes = int(os.environ.get("HTF_MINUTES", "15"))
-        self.buffer_pips_1m = int(os.environ.get("BUFFER_PIPS_1M", "2"))
-        self.lookback_minutes = int(os.environ.get("LOOKBACK_MINUTES", "45"))
+        self.buffer_pips_1m = 6
+        self.lookback_minutes = 1440
         self.symbol_sleep_seconds = float(os.environ.get("SYMBOL_SLEEP_S", "0.35"))
         self.scan_sleep_seconds = int(os.environ.get("SCAN_INTERVAL_S", "60"))
         self._ohlcv_cache = {}
@@ -323,7 +323,7 @@ class SRStationarityBot:
 
         closes = pd.Series(c, dtype=float)
         sma_lb = closes.rolling(self.lookback).mean().to_numpy()
-        std_lb = closes.rolling(self.lookback).std(ddof=0).to_numpy()
+        std_lb = closes.rolling(self.lookback).std(ddof=1).to_numpy()
         with np.errstate(divide="ignore", invalid="ignore"):
             zscore = np.where(std_lb != 0, (c - sma_lb) / std_lb, np.nan)
 
@@ -347,16 +347,7 @@ class SRStationarityBot:
         sma_slope_ok = np.abs(sma50_pct) <= self.max_sma_slope_percent
 
         sma_dist_ticks = np.abs(sma50 - sma200) / min_tick
-
-        price_ref = c[n - 1] if not np.isnan(c[n - 1]) else 1.0
-        if min_tick <= 0.00001:
-            effective_min_dist_ticks = self.min_sma_distance_ticks
-        elif min_tick <= 0.001:
-            effective_min_dist_ticks = self.min_sma_distance_ticks * (0.00001 / min_tick)
-        else:
-            effective_min_dist_ticks = (price_ref * 0.0005) / min_tick
-
-        sma_dist_ok = sma_dist_ticks >= effective_min_dist_ticks
+        sma_dist_ok = sma_dist_ticks >= self.min_sma_distance_ticks
         bull_valid = (sma50 > sma200) & sma_dist_ok & sma_slope_ok
         bear_valid = (sma50 < sma200) & sma_dist_ok & sma_slope_ok
 
@@ -411,7 +402,7 @@ class SRStationarityBot:
                 "volume_osc": float(osc[i]),
                 "bar_time": bar_time_iso,
                 "sma_dist_ticks": float(sma_dist_ticks[i]) if not np.isnan(sma_dist_ticks[i]) else None,
-                "effective_min_dist": float(effective_min_dist_ticks),
+                "effective_min_dist": float(self.min_sma_distance_ticks),
                 "sma_slope_pct": float(sma50_pct[i]) if not np.isnan(sma50_pct[i]) else None,
             }
 
@@ -443,12 +434,15 @@ class SRStationarityBot:
 
         if verbose and not signals:
             i = n - 1
-            print(f"   Bar {m1.index[i]} close={c[i]:.5f} mintick={min_tick} buffer={buffer_price:.6f}")
+            print(
+                f"   Bar {m1.index[i]} close={c[i]:.5f} mintick={min_tick} "
+                f"buffer={buffer_price:.6f} pips={buffer_price / (min_tick * 10):.1f}"
+            )
             print(f"   S/R R={high_use[i]:.5f} S={low_use[i]:.5f} | blue={is_blue[i]} red={is_red[i]}")
             print(f"   entry_L={entry_long[i]} entry_S={entry_short[i]} distR={dist_res[i]:.6f} distS={dist_sup[i]:.6f}")
             print(
                 f"   sma_dist_ticks={sma_dist_ticks[i]:.0f} "
-                f"(eff_min={effective_min_dist_ticks:.0f}) slope_ok={sma_slope_ok[i]}"
+                f"(min={self.min_sma_distance_ticks}) slope_ok={sma_slope_ok[i]}"
             )
             print(f"   bull_valid={bull_valid[i]} bear_valid={bear_valid[i]}")
             print(f"   show_buy={show_buy[i]} show_sell={show_sell[i]}")

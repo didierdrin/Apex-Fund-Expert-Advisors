@@ -11,19 +11,43 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.18
+      - key: PYTHONUNBUFFERED
+        value: 1
       - key: DATABASE_URL
         sync: false
+
+      # Timeframes
       - key: TIMEFRAME
         value: 1m
       - key: HTF_TIMEFRAME
         value: 15m
       - key: HTF_MINUTES
         value: 15
+
+      # Signal filters — tuned for 1m bars
+      - key: MIN_SMA_DIST_TICKS
+        value: 50
+      - key: MAX_SMA_SLOPE_PCT
+        value: 1.0
+      - key: ZSCORE_THRESH
+        value: 1.5
+      - key: LOOKBACK
+        value: 50
+      - key: LEFT_BARS
+        value: 15
+      - key: RIGHT_BARS
+        value: 15
+      - key: TREND_MA_PERIOD
+        value: 20
+
+      # Scanner timing
       - key: SCAN_INTERVAL_S
         value: 120
-      - key: LOOKBACK_MINUTES
-        value: 45
+      - key: SYMBOL_SLEEP_S
+        value: 0.35
+      - key: CACHE_TTL_S
+        value: 55
+
+      # CORS
       - key: CORS_ORIGINS
         value: https://apex-firm.vercel.app,http://localhost:3000
-      - key: PYTHONUNBUFFERED
-        value: 1

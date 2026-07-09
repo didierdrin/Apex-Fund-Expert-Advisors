@@ -527,6 +527,73 @@ def api_alerts():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/debug")
+def debug():
+    """Run signal check on one symbol and return raw filter values for diagnosis."""
+    try:
+        ensure_services_started()
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    symbol = request.args.get("symbol", "EURUSD=X")
+    try:
+        m1 = bot_instance.fetch_ohlcv(symbol, bot_instance.timeframe, bot_instance.min_bars)
+        if m1.empty or len(m1) < bot_instance.min_bars:
+            return jsonify({"symbol": symbol, "error": f"only {len(m1)} bars, need {bot_instance.min_bars}"})
+        m1d = drop_incomplete_bar(m1)
+        c = m1d["Close"].to_numpy(dtype=float)
+        o = m1d["Open"].to_numpy(dtype=float)
+        h = m1d["High"].to_numpy(dtype=float)
+        l = m1d["Low"].to_numpy(dtype=float)
+        n = len(c)
+        min_tick = syminfo_mintick(symbol)
+        closes = pd.Series(c, dtype=float)
+        sma50 = closes.rolling(50).mean().to_numpy()
+        sma200 = closes.rolling(200).mean().to_numpy()
+        sma_dist_ticks = float(abs(sma50[-1] - sma200[-1]) / min_tick) if not (np.isnan(sma50[-1]) or np.isnan(sma200[-1])) else None
+        sma50_prev = sma50[-1 - bot_instance.sma_slope_period] if n > bot_instance.sma_slope_period else sma50[-1]
+        sma_slope_pct = float((sma50[-1] - sma50_prev) / sma50_prev * 100) if sma50_prev else 0.0
+        sma_lb = closes.rolling(bot_instance.lookback).mean().to_numpy()
+        std_lb = closes.rolling(bot_instance.lookback).std(ddof=1).to_numpy()
+        zscore = float((c[-1] - sma_lb[-1]) / std_lb[-1]) if std_lb[-1] else None
+        htf_close = htf_close_from_m1(c, m1d.index, bot_instance.htf_minutes)
+        htf_sma = pd.Series(htf_close).rolling(bot_instance.trend_ma_period).mean().to_numpy()
+        ph = pivothigh_series(h, bot_instance.left_bars, bot_instance.right_bars)
+        pl = pivotlow_series(l, bot_instance.left_bars, bot_instance.right_bars)
+        high_use = fixnan_forward(shift_one(ph))
+        low_use = fixnan_forward(shift_one(pl))
+        buffer_price = bot_instance.buffer_pips_1m * min_tick * 10
+        dist_res = float(abs(c[-1] - high_use[-1])) if not np.isnan(high_use[-1]) else None
+        dist_sup = float(abs(c[-1] - low_use[-1])) if not np.isnan(low_use[-1]) else None
+        return jsonify({
+            "symbol": symbol,
+            "bars": n,
+            "min_bars_required": bot_instance.min_bars,
+            "price": float(c[-1]),
+            "min_tick": min_tick,
+            "sma50": float(sma50[-1]) if not np.isnan(sma50[-1]) else None,
+            "sma200": float(sma200[-1]) if not np.isnan(sma200[-1]) else None,
+            "sma_dist_ticks": sma_dist_ticks,
+            "min_sma_dist_ticks": bot_instance.min_sma_distance_ticks,
+            "sma_dist_ok": sma_dist_ticks is not None and sma_dist_ticks >= bot_instance.min_sma_distance_ticks,
+            "sma_slope_pct": sma_slope_pct,
+            "max_sma_slope_pct": bot_instance.max_sma_slope_percent,
+            "sma_slope_ok": abs(sma_slope_pct) <= bot_instance.max_sma_slope_percent,
+            "zscore": zscore,
+            "zscore_threshold": bot_instance.zscore_threshold,
+            "htf_bull": bool(htf_close[-1] > htf_sma[-1]) if not np.isnan(htf_sma[-1]) else None,
+            "htf_bear": bool(htf_close[-1] < htf_sma[-1]) if not np.isnan(htf_sma[-1]) else None,
+            "resistance": float(high_use[-1]) if not np.isnan(high_use[-1]) else None,
+            "support": float(low_use[-1]) if not np.isnan(low_use[-1]) else None,
+            "dist_to_resistance": dist_res,
+            "dist_to_support": dist_sup,
+            "buffer_price": float(buffer_price),
+            "dist_res_ok": dist_res is not None and dist_res <= buffer_price,
+            "dist_sup_ok": dist_sup is not None and dist_sup <= buffer_price,
+        })
+    except Exception as e:
+        return jsonify({"symbol": symbol, "error": str(e)}), 500
+
+
 @app.route("/status")
 def status():
     if not bot_instance:

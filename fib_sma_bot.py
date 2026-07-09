@@ -208,8 +208,8 @@ class SRStationarityBot:
         self.zscore_threshold = float(os.environ.get("ZSCORE_THRESH", "1.5"))
         self.trend_ma_period = int(os.environ.get("TREND_MA_PERIOD", "20"))
         self.sma_slope_period = int(os.environ.get("SMA_SLOPE_PERIOD", "5"))
-        self.max_sma_slope_percent = 0.25
-        self.min_sma_distance_ticks = 500
+        self.max_sma_slope_percent = float(os.environ.get("MAX_SMA_SLOPE_PCT", "0.25"))
+        self.min_sma_distance_ticks = int(os.environ.get("MIN_SMA_DIST_TICKS", "500"))
         self.stationarity_threshold = float(os.environ.get("STATIONARITY_THRESH", "0.05"))
         self.timeframe = os.environ.get("TIMEFRAME", "1m")
         self.htf_timeframe = os.environ.get("HTF_TIMEFRAME", "15m")

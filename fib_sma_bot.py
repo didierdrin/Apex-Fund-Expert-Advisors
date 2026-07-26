@@ -1,14 +1,17 @@
 """
-SR Break + Stationarity Combined — yfinance + Neon PostgreSQL
-Pine: green/red filtered triangles on 1m (showBuyTriangle / showSellTriangle)
+MTF Fibonacci + SMA Trend Direction — matches fib_sma.pine
+
+TradingView marks (saved as alerts):
+  BUY  (sma50 > sma200): 15m/4h/both breakout + 15m/4h/both pullback
+  SELL (sma50 < sma200): 15m/4h/both breakout + 15m/4h/both pullback
+
+Chart TF = 15m, HTF = 4H, Fib = 0.618 of highest/lowest close over 50 bars.
 """
 
-import json
 import os
 import sys
 import time
 import threading
-import socket
 from datetime import datetime, timezone
 
 import numpy as np
@@ -51,6 +54,7 @@ def _apply_cors_headers(response):
         response.headers["Vary"] = "Origin"
     return response
 
+
 bot_instance = None
 last_check_time = None
 total_signals = 0
@@ -79,24 +83,15 @@ WATCHLIST = [
     "SPY", "QQQ", "DIA", "IWM", "XLF", "XLE", "XLK", "GLD", "SLV", "USO",
 ]
 
-
-def syminfo_mintick(symbol: str) -> float:
-    """Match TradingView syminfo.mintick (point size, not pip)."""
-    if symbol.endswith("=X"):
-        if "JPY" in symbol or "XAU" in symbol or "XAG" in symbol:
-            if "XAU" in symbol or "XAG" in symbol:
-                return 0.01
-            return 0.001
-        return 0.00001
-    if symbol.endswith("-USD"):
-        if symbol in ("SHIB-USD",):
-            return 0.00000001
-        if symbol in ("BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "BCH-USD", "LTC-USD"):
-            return 0.01
-        return 0.0001
-    if symbol.endswith("=F") or symbol.startswith("^"):
-        return 0.01
-    return 0.01
+# Pine plotshape signal keys (must match fib_sma.pine alert JSON "signal" field)
+SIGNAL_DEFS = (
+    ("15m_breakout", "buy_signal_15m", "sell_signal_15m"),
+    ("4h_breakout", "buy_signal_4h", "sell_signal_4h"),
+    ("both_breakout", "buy_signal_both", "sell_signal_both"),
+    ("15m_pullback", "buy_pullback_15m", "sell_pullback_15m"),
+    ("4h_pullback", "buy_pullback_4h", "sell_pullback_4h"),
+    ("both_pullback", "buy_pullback_both", "sell_pullback_both"),
+)
 
 
 def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
@@ -121,58 +116,20 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def drop_incomplete_bar(df: pd.DataFrame) -> pd.DataFrame:
-    """Pine alerts on bar close — drop the still-forming 1m candle."""
+def drop_incomplete_bar(df: pd.DataFrame, bar_minutes: int) -> pd.DataFrame:
+    """Pine alerts on bar close — drop the still-forming candle."""
     if df.empty:
         return df
     now = pd.Timestamp.now(tz="UTC")
     last = pd.Timestamp(df.index[-1]).tz_convert("UTC")
-    if last.floor("min") >= now.floor("min"):
+    bar_start = last.floor(f"{bar_minutes}min")
+    if now < bar_start + pd.Timedelta(minutes=bar_minutes):
         return df.iloc[:-1].copy()
     return df
 
 
-def pivothigh_series(high: np.ndarray, left: int, right: int) -> np.ndarray:
-    n = len(high)
-    out = np.full(n, np.nan)
-    for i in range(left + right, n):
-        center = i - right
-        window = high[center - left : center + right + 1]
-        if len(window) == left + right + 1 and high[center] >= np.nanmax(window):
-            out[i] = high[center]
-    return out
-
-
-def pivotlow_series(low: np.ndarray, left: int, right: int) -> np.ndarray:
-    n = len(low)
-    out = np.full(n, np.nan)
-    for i in range(left + right, n):
-        center = i - right
-        window = low[center - left : center + right + 1]
-        if len(window) == left + right + 1 and low[center] <= np.nanmin(window):
-            out[i] = low[center]
-    return out
-
-
-def fixnan_forward(arr: np.ndarray) -> np.ndarray:
-    out = arr.copy()
-    last = np.nan
-    for i in range(len(out)):
-        if not np.isnan(out[i]):
-            last = out[i]
-        elif not np.isnan(last):
-            out[i] = last
-    return out
-
-
-def shift_one(arr: np.ndarray) -> np.ndarray:
-    out = np.full(len(arr), np.nan)
-    if len(arr) > 1:
-        out[1:] = arr[:-1]
-    return out
-
-
 def crossover(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """ta.crossover(a, b): a crosses above b."""
     out = np.zeros(len(a), dtype=bool)
     for i in range(1, len(a)):
         if np.isnan(a[i - 1]) or np.isnan(b[i - 1]) or np.isnan(a[i]) or np.isnan(b[i]):
@@ -182,6 +139,7 @@ def crossover(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def crossunder(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """ta.crossunder(a, b): a crosses below b."""
     out = np.zeros(len(a), dtype=bool)
     for i in range(1, len(a)):
         if np.isnan(a[i - 1]) or np.isnan(b[i - 1]) or np.isnan(a[i]) or np.isnan(b[i]):
@@ -190,38 +148,59 @@ def crossunder(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return out
 
 
-def htf_close_from_m1(closes: np.ndarray, index: pd.DatetimeIndex, minutes: int = 15) -> np.ndarray:
-    """Pine request.security close: completed HTF bar closes, ffilled to 1m bars."""
-    s = pd.Series(closes, index=pd.to_datetime(index, utc=True))
-    htf = s.resample(f"{minutes}min").last().ffill()
-    return htf.reindex(s.index, method="ffill").to_numpy(dtype=float)
+def fib_618_series(close: pd.Series, length: int = 50, level: float = 0.618) -> pd.Series:
+    """Pine get_fib_levels(close, length) → fib_618."""
+    highest = close.rolling(length).max()
+    lowest = close.rolling(length).min()
+    return lowest + (highest - lowest) * level
 
 
-class SRStationarityBot:
+def htf_fib_on_ltf(
+    ltf_close: pd.Series,
+    htf_minutes: int = 240,
+    fib_length: int = 50,
+    fib_level: float = 0.618,
+) -> np.ndarray:
+    """
+    Match request.security(..., htf, get_fib_levels(close, 50)) with lookahead_off:
+    use only completed HTF bars, then forward-fill onto LTF timestamps.
+    """
+    htf_close = ltf_close.resample(f"{htf_minutes}min").last().dropna()
+    if htf_close.empty:
+        return np.full(len(ltf_close), np.nan)
+
+    now = pd.Timestamp.now(tz="UTC")
+    last_htf_start = pd.Timestamp(htf_close.index[-1]).tz_convert("UTC")
+    if now < last_htf_start + pd.Timedelta(minutes=htf_minutes):
+        htf_close = htf_close.iloc[:-1]
+    if htf_close.empty:
+        return np.full(len(ltf_close), np.nan)
+
+    fib_htf = fib_618_series(htf_close, length=fib_length, level=fib_level)
+    aligned = fib_htf.reindex(ltf_close.index, method="ffill")
+    return aligned.to_numpy(dtype=float)
+
+
+class FibSMATradingBot:
+    """Implements fib_sma.pine MTF Fib 0.618 + SMA50/200 trend filters."""
+
     def __init__(self):
         self.watchlist = list(WATCHLIST)
-        self.toggle_breaks = os.environ.get("TOGGLE_BREAKS", "true").lower() in ("1", "true", "yes")
-        self.left_bars = int(os.environ.get("LEFT_BARS", "15"))
-        self.right_bars = int(os.environ.get("RIGHT_BARS", "15"))
-        self.volume_thresh = 20.0
-        self.lookback = int(os.environ.get("LOOKBACK", "50"))
-        self.zscore_threshold = float(os.environ.get("ZSCORE_THRESH", "1.5"))
-        self.trend_ma_period = int(os.environ.get("TREND_MA_PERIOD", "20"))
-        self.sma_slope_period = int(os.environ.get("SMA_SLOPE_PERIOD", "5"))
-        self.max_sma_slope_percent = float(os.environ.get("MAX_SMA_SLOPE_PCT", "0.25"))
-        self.min_sma_distance_ticks = int(os.environ.get("MIN_SMA_DIST_TICKS", "500"))
-        self.stationarity_threshold = float(os.environ.get("STATIONARITY_THRESH", "0.05"))
-        self.timeframe = os.environ.get("TIMEFRAME", "1m")
-        self.htf_timeframe = os.environ.get("HTF_TIMEFRAME", "15m")
-        self.htf_minutes = int(os.environ.get("HTF_MINUTES", "15"))
-        self.buffer_pips_1m = 6
-        self.lookback_minutes = 1440
+        self.fib_level = float(os.environ.get("FIB_LEVEL", "0.618"))
+        self.fib_length = int(os.environ.get("FIB_LENGTH", "50"))
+        self.sma_fast = int(os.environ.get("SMA_FAST", "50"))
+        self.sma_slow = int(os.environ.get("SMA_SLOW", "200"))
+        # Chart TF = 15m (Pine comment: current chart), HTF = 4H
+        self.timeframe = os.environ.get("TIMEFRAME", "15m")
+        self.htf_timeframe = os.environ.get("HTF_TIMEFRAME", "4h")
+        self.bar_minutes = int(os.environ.get("BAR_MINUTES", "15"))
+        self.htf_minutes = int(os.environ.get("HTF_MINUTES", "240"))
+        self.lookback_bars = int(os.environ.get("LOOKBACK_BARS", "672"))  # ~7d of 15m
+        self.min_bars = max(self.sma_slow + 5, self.fib_length + 5, 220)
         self.symbol_sleep_seconds = float(os.environ.get("SYMBOL_SLEEP_S", "0.35"))
         self.scan_sleep_seconds = int(os.environ.get("SCAN_INTERVAL_S", "60"))
         self._ohlcv_cache = {}
         self._cache_ttl_seconds = int(os.environ.get("CACHE_TTL_S", "55"))
-        pivot_warmup = self.left_bars + self.right_bars + 5
-        self.min_bars = max(250, self.lookback, 50 + self.sma_slope_period, pivot_warmup + 50)
         self.sessions = {
             "asia": {"open": 23, "close": 8, "name": "Asian Session"},
             "london": {"open": 7, "close": 16, "name": "London Session"},
@@ -242,6 +221,7 @@ class SRStationarityBot:
 
     def save_alert(self, alert_data):
         alert_data["session"] = self.get_current_session()
+        alert_data.setdefault("strategy", "fib_sma")
         for key, value in list(alert_data.items()):
             if isinstance(value, (np.bool_, np.integer, np.floating)):
                 alert_data[key] = value.item()
@@ -257,11 +237,23 @@ class SRStationarityBot:
                     return cached["df"].copy()
             except Exception:
                 pass
-        periods_map = {"1m": ["7d", "5d"], "15m": ["60d"], "1h": ["60d", "730d"]}
+        periods_map = {
+            "15m": ["60d", "30d"],
+            "1h": ["730d", "60d"],
+            "60m": ["730d", "60d"],
+            "1m": ["7d", "5d"],
+        }
         best = pd.DataFrame()
         for period in periods_map.get(interval, ["60d"]):
             try:
-                raw = yf.download(symbol, interval=interval, period=period, auto_adjust=True, progress=False, threads=False)
+                raw = yf.download(
+                    symbol,
+                    interval=interval,
+                    period=period,
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,
+                )
                 df = _normalize_ohlcv(raw)
                 if len(df) > len(best):
                     best = df
@@ -270,183 +262,150 @@ class SRStationarityBot:
                     break
             except Exception as e:
                 print(f"   ⚠️  yfinance {symbol} {interval}: {e}")
-        self._ohlcv_cache[cache_key] = {"df": best, "fetched_at": datetime.now(timezone.utc).isoformat()}
+        self._ohlcv_cache[cache_key] = {
+            "df": best,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
         return best.copy()
 
-    def _volume_series(self, df: pd.DataFrame) -> pd.Series:
-        vol = df["Volume"].astype(float).copy()
-        if vol.fillna(0).max() <= 0:
-            vol = (df["High"] - df["Low"]).abs()
-        return vol.replace(0, np.nan).ffill().fillna(1.0)
+    def compute_signals(self, df_15m: pd.DataFrame) -> dict:
+        """
+        Reproduce fib_sma.pine boolean series on closed 15m bars.
+        Returns dict of named bool arrays + context float arrays.
+        """
+        close = df_15m["Close"].astype(float)
+        c = close.to_numpy(dtype=float)
+        n = len(c)
 
-    def check_signals(self, symbol: str, m1: pd.DataFrame, verbose: bool = True) -> list:
-        m1 = drop_incomplete_bar(m1)
-        if len(m1) < self.min_bars:
+        sma50 = close.rolling(self.sma_fast).mean().to_numpy(dtype=float)
+        sma200 = close.rolling(self.sma_slow).mean().to_numpy(dtype=float)
+        bullish_trend = sma50 > sma200
+        bearish_trend = sma50 < sma200
+
+        fib_618_15m = fib_618_series(close, self.fib_length, self.fib_level).to_numpy(dtype=float)
+        fib_618_4h = htf_fib_on_ltf(
+            close,
+            htf_minutes=self.htf_minutes,
+            fib_length=self.fib_length,
+            fib_level=self.fib_level,
+        )
+
+        # Pine: breakout = ta.crossover(close, fib)
+        breakout_15m = crossover(c, fib_618_15m)
+        breakout_4h = crossover(c, fib_618_4h)
+
+        # Pine: pullback = ta.crossunder(close, fib) and close[1] > fib[1]
+        cu_15m = crossunder(c, fib_618_15m)
+        cu_4h = crossunder(c, fib_618_4h)
+        prev_above_15m = np.zeros(n, dtype=bool)
+        prev_above_4h = np.zeros(n, dtype=bool)
+        for i in range(1, n):
+            if not (np.isnan(c[i - 1]) or np.isnan(fib_618_15m[i - 1])):
+                prev_above_15m[i] = c[i - 1] > fib_618_15m[i - 1]
+            if not (np.isnan(c[i - 1]) or np.isnan(fib_618_4h[i - 1])):
+                prev_above_4h[i] = c[i - 1] > fib_618_4h[i - 1]
+        pullback_15m = cu_15m & prev_above_15m
+        pullback_4h = cu_4h & prev_above_4h
+
+        return {
+            "close": c,
+            "sma50": sma50,
+            "sma200": sma200,
+            "fib_15m": fib_618_15m,
+            "fib_4h": fib_618_4h,
+            "bullish_trend": bullish_trend,
+            "bearish_trend": bearish_trend,
+            "breakout_15m": breakout_15m,
+            "breakout_4h": breakout_4h,
+            "pullback_15m": pullback_15m,
+            "pullback_4h": pullback_4h,
+            # BUY (only in bullish trend) — matches plotshape titles
+            "buy_signal_15m": breakout_15m & bullish_trend,
+            "buy_signal_4h": breakout_4h & bullish_trend,
+            "buy_signal_both": breakout_15m & breakout_4h & bullish_trend,
+            "buy_pullback_15m": pullback_15m & bullish_trend,
+            "buy_pullback_4h": pullback_4h & bullish_trend,
+            "buy_pullback_both": pullback_15m & pullback_4h & bullish_trend,
+            # SELL (only in bearish trend)
+            "sell_signal_15m": breakout_15m & bearish_trend,
+            "sell_signal_4h": breakout_4h & bearish_trend,
+            "sell_signal_both": breakout_15m & breakout_4h & bearish_trend,
+            "sell_pullback_15m": pullback_15m & bearish_trend,
+            "sell_pullback_4h": pullback_4h & bearish_trend,
+            "sell_pullback_both": pullback_15m & pullback_4h & bearish_trend,
+        }
+
+    def check_signals(self, symbol: str, df: pd.DataFrame, verbose: bool = True) -> list:
+        df = drop_incomplete_bar(df, self.bar_minutes)
+        if len(df) < self.min_bars:
             if verbose:
-                print(f"   ⚠️  Need {self.min_bars} closed M1 bars, got {len(m1)}")
+                print(f"   ⚠️  Need {self.min_bars} closed {self.timeframe} bars, got {len(df)}")
             return []
 
-        o = m1["Open"].to_numpy(dtype=float)
-        h = m1["High"].to_numpy(dtype=float)
-        l = m1["Low"].to_numpy(dtype=float)
-        c = m1["Close"].to_numpy(dtype=float)
-        n = len(c)
-        min_tick = syminfo_mintick(symbol)
-        buffer_price = self.buffer_pips_1m * min_tick * 10
-
-        ph = pivothigh_series(h, self.left_bars, self.right_bars)
-        pl = pivotlow_series(l, self.left_bars, self.right_bars)
-        high_use = fixnan_forward(shift_one(ph))
-        low_use = fixnan_forward(shift_one(pl))
-
-        vol = self._volume_series(m1).to_numpy(dtype=float)
-        short_vol = pd.Series(vol).ewm(span=5, adjust=False).mean().to_numpy()
-        long_vol = pd.Series(vol).ewm(span=10, adjust=False).mean().to_numpy()
-        with np.errstate(divide="ignore", invalid="ignore"):
-            osc = np.where(long_vol != 0, 100.0 * (short_vol - long_vol) / long_vol, 0.0)
-
-        cross_up = crossover(c, high_use)
-        cross_dn = crossunder(c, low_use)
-        body_bear = (c - o) > (h - c)   # Close lower than open AND lower wick shorter than body
-        body_bull = (c - o) > (o - l)   # Close higher than open AND upper wick shorter than body
-        vol_ok = osc > self.volume_thresh
-
-        is_bear_break = self.toggle_breaks & cross_dn & ~body_bear & vol_ok
-        is_bear_wick = self.toggle_breaks & cross_dn & body_bear
-        is_bull_break = self.toggle_breaks & cross_up & ~body_bull & vol_ok
-        is_bull_wick = self.toggle_breaks & cross_up & body_bull
-        is_red = is_bear_break | is_bear_wick
-        is_blue = is_bull_break | is_bull_wick
-
-        # Stationarity: always True (p_value=0.01 < threshold=0.05), matches Pine
-        is_stationary = bool(0.01 < self.stationarity_threshold)
-
-        closes = pd.Series(c, dtype=float)
-        sma_lb = closes.rolling(self.lookback).mean().to_numpy()
-        std_lb = closes.rolling(self.lookback).std(ddof=1).to_numpy()
-        with np.errstate(divide="ignore", invalid="ignore"):
-            zscore = np.where(std_lb != 0, (c - sma_lb) / std_lb, np.nan)
-
-        htf_close = htf_close_from_m1(c, m1.index, self.htf_minutes)
-        htf_sma = pd.Series(htf_close).rolling(self.trend_ma_period).mean().to_numpy()
-        htf_bull = htf_close > htf_sma
-        htf_bear = htf_close < htf_sma
-
-        sma50 = closes.rolling(50).mean().to_numpy()
-        sma200 = closes.rolling(200).mean().to_numpy()
-
-        sma50_prev = np.full(n, np.nan)
-        if n > self.sma_slope_period:
-            sma50_prev[self.sma_slope_period:] = sma50[: n - self.sma_slope_period]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            sma50_pct = np.where(
-                (~np.isnan(sma50_prev)) & (sma50_prev != 0),
-                (sma50 - sma50_prev) / sma50_prev * 100.0,
-                0.0,
-            )
-        sma_slope_ok = np.abs(sma50_pct) <= self.max_sma_slope_percent
-
-        sma_dist_ticks = np.abs(sma50 - sma200) / min_tick
-        sma_dist_ok = sma_dist_ticks >= self.min_sma_distance_ticks
-        bull_valid = (sma50 > sma200) & sma_dist_ok & sma_slope_ok
-        bear_valid = (sma50 < sma200) & sma_dist_ok & sma_slope_ok
-
-        entry_long = is_stationary & (zscore < -self.zscore_threshold) & htf_bull & bull_valid
-        entry_short = is_stationary & (zscore > self.zscore_threshold) & htf_bear & bear_valid
-
-        dist_sup = np.abs(c - low_use)
-        dist_res = np.abs(c - high_use)
-        show_buy = is_blue & entry_long & (dist_res <= buffer_price)
-        show_sell = is_red & entry_short & (dist_sup <= buffer_price)
-
+        calc = self.compute_signals(df)
+        n = len(calc["close"])
+        start_i = max(1, n - self.lookback_bars)
         signals = []
-        # Time-based lookback: lookback_minutes x 1-minute bars of history
-        last_bar_time = pd.Timestamp(m1.index[-1]).tz_convert("UTC")
-        cutoff_time = last_bar_time - pd.Timedelta(minutes=self.lookback_minutes)
-
-        # Walk backwards to find the first bar at or after the cutoff
-        start_i = max(1, n - self.lookback_minutes)  # floor: never check fewer than lookback_minutes bars
-        for idx in range(n - 1, 0, -1):
-            bar_time = pd.Timestamp(m1.index[idx]).tz_convert("UTC")
-            if bar_time < cutoff_time:
-                start_i = max(1, idx + 1)
-                break
-        else:
-            # All bars are within the lookback window
-            start_i = 1
 
         for i in range(start_i, n):
-            buy_signal = bool(show_buy[i])
-            sell_signal = bool(show_sell[i])
-            if not buy_signal and not sell_signal:
-                continue
-
-            bar_ts = pd.Timestamp(m1.index[i]).tz_convert("UTC")
+            bar_ts = pd.Timestamp(df.index[i]).tz_convert("UTC")
             bar_time_iso = bar_ts.isoformat().replace("+00:00", "Z")
-
+            trend = "bullish" if bool(calc["bullish_trend"][i]) else "bearish"
             ctx = {
-                "price": float(c[i]),
-                "zscore": float(zscore[i]) if not np.isnan(zscore[i]) else None,
-                "is_stationary": bool(is_stationary),
-                "sma50": float(sma50[i]) if not np.isnan(sma50[i]) else None,
-                "sma200": float(sma200[i]) if not np.isnan(sma200[i]) else None,
-                "resistance": float(high_use[i]) if not np.isnan(high_use[i]) else None,
-                "support": float(low_use[i]) if not np.isnan(low_use[i]) else None,
-                "dist_to_resistance": float(dist_res[i]),
-                "dist_to_support": float(dist_sup[i]),
-                "buffer_price": float(buffer_price),
-                "htf_close": float(htf_close[i]) if not np.isnan(htf_close[i]) else None,
-                "htf_sma": float(htf_sma[i]) if not np.isnan(htf_sma[i]) else None,
+                "price": float(calc["close"][i]),
+                "sma50": float(calc["sma50"][i]) if not np.isnan(calc["sma50"][i]) else None,
+                "sma200": float(calc["sma200"][i]) if not np.isnan(calc["sma200"][i]) else None,
+                "fib_15m": float(calc["fib_15m"][i]) if not np.isnan(calc["fib_15m"][i]) else None,
+                "fib_4h": float(calc["fib_4h"][i]) if not np.isnan(calc["fib_4h"][i]) else None,
+                "trend": trend,
                 "timeframe": self.timeframe,
                 "htf_timeframe": self.htf_timeframe,
-                "volume_osc": float(osc[i]),
                 "bar_time": bar_time_iso,
-                "sma_dist_ticks": float(sma_dist_ticks[i]) if not np.isnan(sma_dist_ticks[i]) else None,
-                "effective_min_dist": float(self.min_sma_distance_ticks),
-                "sma_slope_pct": float(sma50_pct[i]) if not np.isnan(sma50_pct[i]) else None,
+                "strategy": "fib_sma",
             }
 
-            if buy_signal and not db_alerts.alert_exists(symbol, "BUY", bar_time_iso):
-                signals.append({
-                    "type": "BUY",
-                    "signal": "sr_break_stationarity_buy_triangle",
-                    "confidence": "HIGH",
-                    **ctx,
-                })
-                if verbose:
-                    print(
-                        f"   🎯 BUY  @ {bar_time_iso} price={c[i]:.5f} z={zscore[i]:.2f} "
-                        f"dist_ok={sma_dist_ok[i]} slope_ok={sma_slope_ok[i]}"
-                    )
-
-            if sell_signal and not db_alerts.alert_exists(symbol, "SELL", bar_time_iso):
-                signals.append({
-                    "type": "SELL",
-                    "signal": "sr_break_stationarity_sell_triangle",
-                    "confidence": "HIGH",
-                    **ctx,
-                })
-                if verbose:
-                    print(
-                        f"   🎯 SELL @ {bar_time_iso} price={c[i]:.5f} z={zscore[i]:.2f} "
-                        f"dist_ok={sma_dist_ok[i]} slope_ok={sma_slope_ok[i]}"
-                    )
+            for signal_name, buy_key, sell_key in SIGNAL_DEFS:
+                if bool(calc[buy_key][i]):
+                    if not db_alerts.alert_exists(symbol, "BUY", bar_time_iso, signal_name):
+                        conf = "HIGH" if "both" in signal_name else "MEDIUM"
+                        signals.append({
+                            "type": "BUY",
+                            "signal": signal_name,
+                            "confidence": conf,
+                            **ctx,
+                        })
+                        if verbose:
+                            print(
+                                f"   🎯 BUY  {signal_name} @ {bar_time_iso} "
+                                f"price={ctx['price']:.5f} fib15={ctx['fib_15m']} fib4h={ctx['fib_4h']}"
+                            )
+                if bool(calc[sell_key][i]):
+                    if not db_alerts.alert_exists(symbol, "SELL", bar_time_iso, signal_name):
+                        conf = "HIGH" if "both" in signal_name else "MEDIUM"
+                        signals.append({
+                            "type": "SELL",
+                            "signal": signal_name,
+                            "confidence": conf,
+                            **ctx,
+                        })
+                        if verbose:
+                            print(
+                                f"   🎯 SELL {signal_name} @ {bar_time_iso} "
+                                f"price={ctx['price']:.5f} fib15={ctx['fib_15m']} fib4h={ctx['fib_4h']}"
+                            )
 
         if verbose and not signals:
             i = n - 1
             print(
-                f"   Bar {m1.index[i]} close={c[i]:.5f} mintick={min_tick} "
-                f"buffer={buffer_price:.6f} pips={buffer_price / (min_tick * 10):.1f}"
+                f"   Bar {df.index[i]} close={calc['close'][i]:.5f} "
+                f"trend={'BULL' if calc['bullish_trend'][i] else 'BEAR'} "
+                f"fib15={calc['fib_15m'][i]:.5f} fib4h={calc['fib_4h'][i]:.5f}"
             )
-            print(f"   S/R R={high_use[i]:.5f} S={low_use[i]:.5f} | blue={is_blue[i]} red={is_red[i]}")
-            print(f"   entry_L={entry_long[i]} entry_S={entry_short[i]} distR={dist_res[i]:.6f} distS={dist_sup[i]:.6f}")
             print(
-                f"   sma_dist_ticks={sma_dist_ticks[i]:.0f} "
-                f"(min={self.min_sma_distance_ticks}) slope_ok={sma_slope_ok[i]}"
+                f"   bo15={calc['breakout_15m'][i]} bo4h={calc['breakout_4h'][i]} "
+                f"pb15={calc['pullback_15m'][i]} pb4h={calc['pullback_4h'][i]}"
             )
-            print(f"   bull_valid={bull_valid[i]} bear_valid={bear_valid[i]}")
-            print(f"   show_buy={show_buy[i]} show_sell={show_sell[i]}")
-            print("   ℹ️  No new triangle alert in lookback window")
+            print("   ℹ️  No new Fib SMA marks in lookback window")
 
         return signals
 
@@ -454,7 +413,10 @@ class SRStationarityBot:
         global last_check_time, total_signals
         self._ohlcv_cache.clear()
         print(f"\n{'='*60}")
-        print(f"🚀 Scan {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC | {len(self.watchlist)} symbols")
+        print(
+            f"🚀 Fib SMA scan {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC "
+            f"| {len(self.watchlist)} symbols | {self.timeframe}/{self.htf_timeframe}"
+        )
         print(f"{'='*60}")
         session = self.get_current_session()
         last_check_time = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -462,11 +424,11 @@ class SRStationarityBot:
         for symbol in self.watchlist:
             print(f"\n🔍 {symbol}…")
             try:
-                m1 = self.fetch_ohlcv(symbol, self.timeframe, self.min_bars)
-                if len(m1) < self.min_bars + 1:
-                    print(f"   ⚠️  Skipping — only {len(m1)} bars")
+                df = self.fetch_ohlcv(symbol, self.timeframe, self.min_bars)
+                if len(df) < self.min_bars + 1:
+                    print(f"   ⚠️  Skipping — only {len(df)} bars")
                     continue
-                for sig in self.check_signals(symbol, m1, verbose=True):
+                for sig in self.check_signals(symbol, df, verbose=True):
                     if self.save_alert({"symbol": symbol, "session": session, **sig}):
                         found += 1
                         total_signals += 1
@@ -484,7 +446,7 @@ def ensure_services_started():
     global bot_instance, _scanner_started
     if bot_instance is None:
         db_alerts.init_db()
-        bot_instance = SRStationarityBot()
+        bot_instance = FibSMATradingBot()
     if _scanner_started:
         return
     if os.environ.get("BOT_RUN_ONCE", "").lower() in ("1", "true", "yes"):
@@ -505,12 +467,15 @@ def _lazy_start():
     return None
 
 
-FibSMATradingBot = SRStationarityBot
-
-
 @app.route("/")
 def home():
-    return jsonify({"status": "running", "storage": "neon_postgresql", "last_check": last_check_time, "total_signals": total_signals})
+    return jsonify({
+        "status": "running",
+        "strategy": "fib_sma",
+        "storage": "neon_postgresql",
+        "last_check": last_check_time,
+        "total_signals": total_signals,
+    })
 
 
 @app.route("/health")
@@ -529,66 +494,47 @@ def api_alerts():
 
 @app.route("/debug")
 def debug():
-    """Run signal check on one symbol and return raw filter values for diagnosis."""
+    """Run Fib SMA calc on one symbol and return last-bar filter values."""
     try:
         ensure_services_started()
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
     symbol = request.args.get("symbol", "EURUSD=X")
     try:
-        m1 = bot_instance.fetch_ohlcv(symbol, bot_instance.timeframe, bot_instance.min_bars)
-        if m1.empty or len(m1) < bot_instance.min_bars:
-            return jsonify({"symbol": symbol, "error": f"only {len(m1)} bars, need {bot_instance.min_bars}"})
-        m1d = drop_incomplete_bar(m1)
-        c = m1d["Close"].to_numpy(dtype=float)
-        o = m1d["Open"].to_numpy(dtype=float)
-        h = m1d["High"].to_numpy(dtype=float)
-        l = m1d["Low"].to_numpy(dtype=float)
-        n = len(c)
-        min_tick = syminfo_mintick(symbol)
-        closes = pd.Series(c, dtype=float)
-        sma50 = closes.rolling(50).mean().to_numpy()
-        sma200 = closes.rolling(200).mean().to_numpy()
-        sma_dist_ticks = float(abs(sma50[-1] - sma200[-1]) / min_tick) if not (np.isnan(sma50[-1]) or np.isnan(sma200[-1])) else None
-        sma50_prev = sma50[-1 - bot_instance.sma_slope_period] if n > bot_instance.sma_slope_period else sma50[-1]
-        sma_slope_pct = float((sma50[-1] - sma50_prev) / sma50_prev * 100) if sma50_prev else 0.0
-        sma_lb = closes.rolling(bot_instance.lookback).mean().to_numpy()
-        std_lb = closes.rolling(bot_instance.lookback).std(ddof=1).to_numpy()
-        zscore = float((c[-1] - sma_lb[-1]) / std_lb[-1]) if std_lb[-1] else None
-        htf_close = htf_close_from_m1(c, m1d.index, bot_instance.htf_minutes)
-        htf_sma = pd.Series(htf_close).rolling(bot_instance.trend_ma_period).mean().to_numpy()
-        ph = pivothigh_series(h, bot_instance.left_bars, bot_instance.right_bars)
-        pl = pivotlow_series(l, bot_instance.left_bars, bot_instance.right_bars)
-        high_use = fixnan_forward(shift_one(ph))
-        low_use = fixnan_forward(shift_one(pl))
-        buffer_price = bot_instance.buffer_pips_1m * min_tick * 10
-        dist_res = float(abs(c[-1] - high_use[-1])) if not np.isnan(high_use[-1]) else None
-        dist_sup = float(abs(c[-1] - low_use[-1])) if not np.isnan(low_use[-1]) else None
+        df = bot_instance.fetch_ohlcv(symbol, bot_instance.timeframe, bot_instance.min_bars)
+        if df.empty or len(df) < bot_instance.min_bars:
+            return jsonify({
+                "symbol": symbol,
+                "error": f"only {len(df)} bars, need {bot_instance.min_bars}",
+            })
+        dfd = drop_incomplete_bar(df, bot_instance.bar_minutes)
+        calc = bot_instance.compute_signals(dfd)
+        i = len(calc["close"]) - 1
+        marks = []
+        for signal_name, buy_key, sell_key in SIGNAL_DEFS:
+            if bool(calc[buy_key][i]):
+                marks.append({"type": "BUY", "signal": signal_name})
+            if bool(calc[sell_key][i]):
+                marks.append({"type": "SELL", "signal": signal_name})
         return jsonify({
             "symbol": symbol,
-            "bars": n,
-            "min_bars_required": bot_instance.min_bars,
-            "price": float(c[-1]),
-            "min_tick": min_tick,
-            "sma50": float(sma50[-1]) if not np.isnan(sma50[-1]) else None,
-            "sma200": float(sma200[-1]) if not np.isnan(sma200[-1]) else None,
-            "sma_dist_ticks": sma_dist_ticks,
-            "min_sma_dist_ticks": bot_instance.min_sma_distance_ticks,
-            "sma_dist_ok": sma_dist_ticks is not None and sma_dist_ticks >= bot_instance.min_sma_distance_ticks,
-            "sma_slope_pct": sma_slope_pct,
-            "max_sma_slope_pct": bot_instance.max_sma_slope_percent,
-            "sma_slope_ok": abs(sma_slope_pct) <= bot_instance.max_sma_slope_percent,
-            "zscore": zscore,
-            "zscore_threshold": bot_instance.zscore_threshold,
-            "htf_bull": bool(htf_close[-1] > htf_sma[-1]) if not np.isnan(htf_sma[-1]) else None,
-            "htf_bear": bool(htf_close[-1] < htf_sma[-1]) if not np.isnan(htf_sma[-1]) else None,
-            "resistance": float(high_use[-1]) if not np.isnan(high_use[-1]) else None,
-            "support": float(low_use[-1]) if not np.isnan(low_use[-1]) else None,
-            "dist_to_resistance": dist_res,
-            "dist_to_support": dist_sup,
-            "buffer_price": float(buffer_price),
-            "dist_res_ok": dist_res is not None and dist_res <= buffer_price,
-            "dist_sup_ok": dist_sup is not None and dist_sup <= buffer_price,
+            "bars": len(calc["close"]),
+            "bar_time": pd.Timestamp(dfd.index[i]).tz_convert("UTC").isoformat().replace("+00:00", "Z"),
+            "price": float(calc["close"][i]),
+            "sma50": float(calc["sma50"][i]) if not np.isnan(calc["sma50"][i]) else None,
+            "sma200": float(calc["sma200"][i]) if not np.isnan(calc["sma200"][i]) else None,
+            "trend": "bullish" if bool(calc["bullish_trend"][i]) else "bearish",
+            "fib_15m": float(calc["fib_15m"][i]) if not np.isnan(calc["fib_15m"][i]) else None,
+            "fib_4h": float(calc["fib_4h"][i]) if not np.isnan(calc["fib_4h"][i]) else None,
+            "breakout_15m": bool(calc["breakout_15m"][i]),
+            "breakout_4h": bool(calc["breakout_4h"][i]),
+            "pullback_15m": bool(calc["pullback_15m"][i]),
+            "pullback_4h": bool(calc["pullback_4h"][i]),
+            "marks_on_last_bar": marks,
+            "timeframe": bot_instance.timeframe,
+            "htf_timeframe": bot_instance.htf_timeframe,
+            "fib_level": bot_instance.fib_level,
+            "fib_length": bot_instance.fib_length,
         })
     except Exception as e:
         return jsonify({"symbol": symbol, "error": str(e)}), 500
@@ -601,12 +547,18 @@ def status():
     return jsonify({
         "status": "running",
         "storage": "neon_postgresql",
-        "strategy": "SR Break + Stationarity 1m",
+        "strategy": "fib_sma",
+        "pine": "MTF Fibonacci + SMA Trend Direction",
         "timeframe": bot_instance.timeframe,
         "htf_timeframe": bot_instance.htf_timeframe,
+        "fib_level": bot_instance.fib_level,
+        "fib_length": bot_instance.fib_length,
+        "sma_fast": bot_instance.sma_fast,
+        "sma_slow": bot_instance.sma_slow,
         "symbols": len(bot_instance.watchlist),
         "last_check": last_check_time,
         "total_signals": total_signals,
+        "signal_types": [s[0] for s in SIGNAL_DEFS],
     })
 
 
@@ -624,7 +576,7 @@ def bootstrap(start_scanner: bool = True):
     """One-shot scan mode (cron) or prepare bot instance for web server."""
     global bot_instance
     db_alerts.init_db()
-    bot_instance = SRStationarityBot()
+    bot_instance = FibSMATradingBot()
     run_once = os.environ.get("BOT_RUN_ONCE", "").lower() in ("1", "true", "yes")
     if run_once:
         bot_instance.scan_watchlist()
@@ -634,7 +586,7 @@ def bootstrap(start_scanner: bool = True):
 
 
 if __name__ == "__main__":
-    print("🚀 SR Break + Stationarity Bot | yfinance + Neon PostgreSQL")
+    print("🚀 Fib SMA Bot | matches fib_sma.pine | yfinance + Neon PostgreSQL")
     run_once = os.environ.get("BOT_RUN_ONCE", "").lower() in ("1", "true", "yes")
     if run_once:
         bootstrap(start_scanner=False)

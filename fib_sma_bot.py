@@ -639,14 +639,24 @@ def run_bot():
 def bootstrap(start_scanner: bool = True):
     """One-shot scan mode (cron) or prepare bot instance for web server."""
     global bot_instance
-    db_alerts.init_db()
-    bot_instance = FibSMATradingBot()
     run_once = os.environ.get("BOT_RUN_ONCE", "").lower() in ("1", "true", "yes")
     if run_once:
+        # Cron/batch mode: let a DB failure raise so the scheduler sees a
+        # nonzero exit instead of silently skipping the scan.
+        db_alerts.init_db()
+        bot_instance = FibSMATradingBot()
         bot_instance.scan_watchlist()
         return
     if start_scanner:
-        ensure_services_started()
+        # Persistent web server: never let a boot-time DB hiccup (bad
+        # DATABASE_URL, Neon cold-start, network blip) crash the whole
+        # process before it can bind $PORT — that turns a transient/fixable
+        # DB issue into a full failed deploy. Retry lazily per request
+        # instead, same as the gunicorn path (see _lazy_start below).
+        try:
+            ensure_services_started()
+        except Exception as exc:
+            print(f"⚠️ Deferred service boot (will retry on first request): {exc}")
 
 
 if __name__ == "__main__":

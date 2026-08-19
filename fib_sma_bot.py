@@ -220,8 +220,12 @@ class FibSMATradingBot:
         self.fib_length = int(os.environ.get("FIB_LENGTH", "50"))
         self.sma_fast = int(os.environ.get("SMA_FAST", "50"))
         self.sma_slow = int(os.environ.get("SMA_SLOW", "200"))
-        # Chart TF = 15m (Pine comment: current chart), HTF = 4H
-        self.timeframe = os.environ.get("TIMEFRAME", "15m")
+        # Chart TF defaults to 1m (fastest way to get a verifiable mark; Pine's
+        # "current chart" adapts to whatever timeframe you view it on). HTF
+        # stays fixed at 4H, matching fib_sma.pine's actual default input —
+        # safe at any chart TF since HTF bars are now fetched independently
+        # (see fetch_htf_close) instead of resampled from the chart series.
+        self.timeframe = os.environ.get("TIMEFRAME", "1m")
         self.htf_timeframe = os.environ.get("HTF_TIMEFRAME", "4h")
         # BAR_MINUTES/HTF_MINUTES are optional overrides — derived from
         # TIMEFRAME/HTF_TIMEFRAME by default so they can't silently drift out
@@ -234,7 +238,7 @@ class FibSMATradingBot:
         self.htf_minutes = int(
             os.environ.get("HTF_MINUTES") or timeframe_to_minutes(self.htf_timeframe, 240)
         )
-        self.lookback_bars = int(os.environ.get("LOOKBACK_BARS", "672"))  # ~7d of 15m
+        self.lookback_bars = int(os.environ.get("LOOKBACK_BARS", "2000"))  # ~33h of 1m
         self.min_bars = max(self.sma_slow + 5, self.fib_length + 5, 220)
         self.symbol_sleep_seconds = float(os.environ.get("SYMBOL_SLEEP_S", "0.35"))
         self.scan_sleep_seconds = int(os.environ.get("SCAN_INTERVAL_S", "60"))

@@ -1,4 +1,9 @@
-# SR Break + Stationarity bot - web service + background 1m scanner
+# Fib SMA bot (matches fib_sma.pine) - web service + background scanner
+#
+# NOTE: TIMEFRAME=1m below is a deliberately fast base timeframe for quickly
+# verifying marks fire in production. HTF stays 4h/240min (Pine's actual
+# default) — fib_sma_bot.py fetches HTF bars independently of the base
+# timeframe's fetch, so this is safe even at TIMEFRAME=1m.
 
 services:
   - type: web
@@ -16,33 +21,33 @@ services:
       - key: DATABASE_URL
         sync: false
 
-      # Timeframes
+      # Timeframes (Pine: chart timeframe + fixed 4H HTF)
       - key: TIMEFRAME
         value: 1m
+      - key: BAR_MINUTES
+        value: 1
       - key: HTF_TIMEFRAME
-        value: 15m
+        value: 4h
       - key: HTF_MINUTES
-        value: 15
+        value: 240
 
-      # Signal filters — tuned for 1m bars
-      - key: MIN_SMA_DIST_TICKS
+      # Fib + SMA (match fib_sma.pine inputs)
+      - key: FIB_LEVEL
+        value: 0.618
+      - key: FIB_LENGTH
         value: 50
-      - key: MAX_SMA_SLOPE_PCT
-        value: 1.0
-      - key: ZSCORE_THRESH
-        value: 1.5
-      - key: LOOKBACK
+      - key: SMA_FAST
         value: 50
-      - key: LEFT_BARS
-        value: 15
-      - key: RIGHT_BARS
-        value: 15
-      - key: TREND_MA_PERIOD
-        value: 20
+      - key: SMA_SLOW
+        value: 200
+
+      # How many closed bars to scan for missed marks
+      - key: LOOKBACK_BARS
+        value: 2000
 
       # Scanner timing
       - key: SCAN_INTERVAL_S
-        value: 120
+        value: 60
       - key: SYMBOL_SLEEP_S
         value: 0.35
       - key: CACHE_TTL_S

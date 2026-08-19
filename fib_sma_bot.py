@@ -155,8 +155,32 @@ def fib_618_series(close: pd.Series, length: int = 50, level: float = 0.618) -> 
     return lowest + (highest - lowest) * level
 
 
+_TF_UNIT_MINUTES = {"m": 1, "h": 60, "d": 1440}
+
+
+def timeframe_to_minutes(tf: str, default: int) -> int:
+    """Parse '1m'/'15m'/'4h'/'1d' style strings into minutes; fall back to default."""
+    tf = (tf or "").strip().lower()
+    if len(tf) >= 2 and tf[-1] in _TF_UNIT_MINUTES and tf[:-1].isdigit():
+        return int(tf[:-1]) * _TF_UNIT_MINUTES[tf[-1]]
+    return default
+
+
+def htf_fetch_interval(htf_minutes: int) -> str:
+    """
+    Native yfinance interval to fetch HTF bars from, independent of whatever
+    (possibly very short) base timeframe the LTF series uses. Pine's
+    request.security() pulls HTF bars from the exchange directly rather than
+    resampling the chart's own series — this mirrors that so a 50-bar HTF Fib
+    window isn't bottlenecked by the LTF interval's yfinance history cap
+    (e.g. 1m bars are capped at 7d, too short for a 50-bar 4H window).
+    """
+    return "5m" if htf_minutes < 60 else "1h"
+
+
 def htf_fib_on_ltf(
-    ltf_close: pd.Series,
+    ltf_index: pd.Index,
+    htf_close_raw: pd.Series,
     htf_minutes: int = 240,
     fib_length: int = 50,
     fib_level: float = 0.618,
@@ -164,20 +188,26 @@ def htf_fib_on_ltf(
     """
     Match request.security(..., htf, get_fib_levels(close, 50)) with lookahead_off:
     use only completed HTF bars, then forward-fill onto LTF timestamps.
+
+    htf_close_raw must be fetched independently (see htf_fetch_interval) so its
+    history depth isn't limited by the LTF series' own fetch window.
     """
-    htf_close = ltf_close.resample(f"{htf_minutes}min").last().dropna()
+    if htf_close_raw.empty:
+        return np.full(len(ltf_index), np.nan)
+
+    htf_close = htf_close_raw.resample(f"{htf_minutes}min").last().dropna()
     if htf_close.empty:
-        return np.full(len(ltf_close), np.nan)
+        return np.full(len(ltf_index), np.nan)
 
     now = pd.Timestamp.now(tz="UTC")
     last_htf_start = pd.Timestamp(htf_close.index[-1]).tz_convert("UTC")
     if now < last_htf_start + pd.Timedelta(minutes=htf_minutes):
         htf_close = htf_close.iloc[:-1]
     if htf_close.empty:
-        return np.full(len(ltf_close), np.nan)
+        return np.full(len(ltf_index), np.nan)
 
     fib_htf = fib_618_series(htf_close, length=fib_length, level=fib_level)
-    aligned = fib_htf.reindex(ltf_close.index, method="ffill")
+    aligned = fib_htf.reindex(ltf_index, method="ffill")
     return aligned.to_numpy(dtype=float)
 
 
@@ -193,8 +223,17 @@ class FibSMATradingBot:
         # Chart TF = 15m (Pine comment: current chart), HTF = 4H
         self.timeframe = os.environ.get("TIMEFRAME", "15m")
         self.htf_timeframe = os.environ.get("HTF_TIMEFRAME", "4h")
-        self.bar_minutes = int(os.environ.get("BAR_MINUTES", "15"))
-        self.htf_minutes = int(os.environ.get("HTF_MINUTES", "240"))
+        # BAR_MINUTES/HTF_MINUTES are optional overrides — derived from
+        # TIMEFRAME/HTF_TIMEFRAME by default so they can't silently drift out
+        # of sync with them (e.g. TIMEFRAME=1m deployed without BAR_MINUTES
+        # would otherwise fall back to a stale "15" and break bar-close
+        # detection, which is exactly what happened to this bot's marking).
+        self.bar_minutes = int(
+            os.environ.get("BAR_MINUTES") or timeframe_to_minutes(self.timeframe, 15)
+        )
+        self.htf_minutes = int(
+            os.environ.get("HTF_MINUTES") or timeframe_to_minutes(self.htf_timeframe, 240)
+        )
         self.lookback_bars = int(os.environ.get("LOOKBACK_BARS", "672"))  # ~7d of 15m
         self.min_bars = max(self.sma_slow + 5, self.fib_length + 5, 220)
         self.symbol_sleep_seconds = float(os.environ.get("SYMBOL_SLEEP_S", "0.35"))
@@ -242,6 +281,7 @@ class FibSMATradingBot:
             "1h": ["730d", "60d"],
             "60m": ["730d", "60d"],
             "1m": ["7d", "5d"],
+            "5m": ["60d", "30d"],
         }
         best = pd.DataFrame()
         for period in periods_map.get(interval, ["60d"]):
@@ -268,7 +308,21 @@ class FibSMATradingBot:
         }
         return best.copy()
 
-    def compute_signals(self, df_15m: pd.DataFrame) -> dict:
+    def fetch_htf_close(self, symbol: str) -> pd.Series:
+        """
+        Fetch the HTF close series independently of the LTF fetch (mirrors Pine's
+        request.security pulling HTF bars straight from the exchange). Prevents a
+        short base TIMEFRAME's yfinance history cap (e.g. 1m → 7d) from starving
+        the HTF Fib window of enough completed bars to ever resolve.
+        """
+        interval = htf_fetch_interval(self.htf_minutes)
+        min_len = self.fib_length + 5
+        df = self.fetch_ohlcv(symbol, interval, min_len)
+        if df.empty:
+            return pd.Series(dtype=float)
+        return df["Close"].astype(float)
+
+    def compute_signals(self, df_15m: pd.DataFrame, htf_close_raw: pd.Series) -> dict:
         """
         Reproduce fib_sma.pine boolean series on closed 15m bars.
         Returns dict of named bool arrays + context float arrays.
@@ -284,7 +338,8 @@ class FibSMATradingBot:
 
         fib_618_15m = fib_618_series(close, self.fib_length, self.fib_level).to_numpy(dtype=float)
         fib_618_4h = htf_fib_on_ltf(
-            close,
+            close.index,
+            htf_close_raw,
             htf_minutes=self.htf_minutes,
             fib_length=self.fib_length,
             fib_level=self.fib_level,
@@ -342,7 +397,8 @@ class FibSMATradingBot:
                 print(f"   ⚠️  Need {self.min_bars} closed {self.timeframe} bars, got {len(df)}")
             return []
 
-        calc = self.compute_signals(df)
+        htf_close_raw = self.fetch_htf_close(symbol)
+        calc = self.compute_signals(df, htf_close_raw)
         n = len(calc["close"])
         start_i = max(1, n - self.lookback_bars)
         signals = []
@@ -508,7 +564,8 @@ def debug():
                 "error": f"only {len(df)} bars, need {bot_instance.min_bars}",
             })
         dfd = drop_incomplete_bar(df, bot_instance.bar_minutes)
-        calc = bot_instance.compute_signals(dfd)
+        htf_close_raw = bot_instance.fetch_htf_close(symbol)
+        calc = bot_instance.compute_signals(dfd, htf_close_raw)
         i = len(calc["close"]) - 1
         marks = []
         for signal_name, buy_key, sell_key in SIGNAL_DEFS:
@@ -533,6 +590,9 @@ def debug():
             "marks_on_last_bar": marks,
             "timeframe": bot_instance.timeframe,
             "htf_timeframe": bot_instance.htf_timeframe,
+            "bar_minutes": bot_instance.bar_minutes,
+            "htf_minutes": bot_instance.htf_minutes,
+            "htf_bars_fetched": int(len(htf_close_raw)),
             "fib_level": bot_instance.fib_level,
             "fib_length": bot_instance.fib_length,
         })
